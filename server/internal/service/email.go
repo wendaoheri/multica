@@ -234,7 +234,7 @@ func NewEmailService() *EmailService {
 	case client != nil:
 		fmt.Printf("EmailService: Resend API from=%s\n", from)
 	default:
-		fmt.Println("EmailService: DEV mode — codes printed to stdout (set MULTICA_DEV_VERIFICATION_CODE in .env for a fixed local code)")
+		fmt.Println("EmailService: DEV mode — codes printed to stdout (for a fixed local code set MULTICA_DEV_VERIFICATION_CODE and MULTICA_DEV_VERIFICATION_CODE_ENABLED=true in .env, with APP_ENV non-production)")
 	}
 
 	return &EmailService{

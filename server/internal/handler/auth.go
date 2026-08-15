@@ -24,6 +24,7 @@ import (
 	"github.com/multica-ai/multica/server/internal/logger"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/multica-ai/multica/server/pkg/redact"
 )
 
 // SignupError represents signup restriction errors
@@ -39,6 +40,13 @@ var ErrSignupProhibited = SignupError{Message: "user registration is disabled on
 var ErrEmailNotAllowed = SignupError{Message: "email address or domain not allowed on this instance"}
 
 const devVerificationCodeEnv = "MULTICA_DEV_VERIFICATION_CODE"
+
+// devVerificationCodeEnabledEnv is the explicit opt-in switch for the fixed
+// development verification code. The bypass is double-gated: it only works
+// when APP_ENV is not production AND this flag is explicitly truthy, so a
+// leaked or leftover MULTICA_DEV_VERIFICATION_CODE alone can never unlock a
+// login.
+const devVerificationCodeEnabledEnv = "MULTICA_DEV_VERIFICATION_CODE_ENABLED"
 
 // supportedLanguages mirrors `SUPPORTED_LOCALES` in packages/core/i18n/types.ts.
 // Keep both lists in sync when adding a locale — the user-controlled `language`
@@ -121,7 +129,7 @@ func generateCode() (string, error) {
 }
 
 func isDevVerificationCode(code string) bool {
-	if isProductionEnv() {
+	if isProductionEnv() || !isDevVerificationCodeExplicitlyEnabled() {
 		return false
 	}
 
@@ -135,6 +143,15 @@ func isDevVerificationCode(code string) bool {
 
 func isProductionEnv() bool {
 	return strings.EqualFold(strings.TrimSpace(os.Getenv("APP_ENV")), "production")
+}
+
+// isDevVerificationCodeExplicitlyEnabled reports whether the operator opted
+// into the fixed development verification code. Only "true"/"1" (after trim,
+// case-insensitive) count — an empty, missing, or malformed value keeps the
+// bypass off, so the gate fails closed.
+func isDevVerificationCodeExplicitlyEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(devVerificationCodeEnabledEnv)))
+	return v == "true" || v == "1"
 }
 
 func isSixDigitCode(code string) bool {
@@ -455,10 +472,52 @@ type googleTokenResponse struct {
 	TokenType   string `json:"token_type"`
 }
 
+// googleTokenErrorDetail extracts only the structured error fields from a
+// failed Google token endpoint response. The raw body is deliberately not
+// returned: it may echo request parameters or otherwise contain sensitive
+// data, so callers must log these fields instead of the body. Malformed or
+// non-JSON bodies yield empty strings, which callers skip. The description
+// is truncated and passed through the secret redactor so a hostile or
+// misconfigured upstream cannot smuggle credentials into the logs.
+func googleTokenErrorDetail(body []byte) (code string, description string) {
+	var e struct {
+		Error            string `json:"error"`
+		ErrorDescription string `json:"error_description"`
+	}
+	if err := json.Unmarshal(body, &e); err != nil {
+		return "", ""
+	}
+	code = strings.TrimSpace(e.Error)
+	description = strings.TrimSpace(e.ErrorDescription)
+	if runes := []rune(description); len(runes) > googleTokenErrorDescriptionMaxRunes {
+		description = string(runes[:googleTokenErrorDescriptionMaxRunes])
+	}
+	return code, redact.Text(description)
+}
+
+// googleTokenErrorDescriptionMaxRunes caps the logged error_description so a
+// runaway upstream response cannot bloat the logs.
+const googleTokenErrorDescriptionMaxRunes = 200
+
 type googleUserInfo struct {
-	Email   string `json:"email"`
-	Name    string `json:"name"`
-	Picture string `json:"picture"`
+	Email string `json:"email"`
+	// Google's v2 userinfo endpoint reports verification as verified_email;
+	// the OIDC userinfo shape uses email_verified. Both are captured so the
+	// check below fails closed no matter which payload shape arrives — a
+	// missing flag must reject the login, not allow it.
+	VerifiedEmail *bool  `json:"verified_email"`
+	EmailVerified *bool  `json:"email_verified"`
+	Name          string `json:"name"`
+	Picture       string `json:"picture"`
+}
+
+// isEmailVerified reports whether Google explicitly attested the email as
+// verified. Only an explicit true from either supported field shape counts;
+// missing or false rejects the login so unverified addresses can never be
+// used for account linking.
+func (u googleUserInfo) isEmailVerified() bool {
+	return (u.VerifiedEmail != nil && *u.VerifiedEmail) ||
+		(u.EmailVerified != nil && *u.EmailVerified)
 }
 
 func (h *Handler) GoogleLogin(w http.ResponseWriter, r *http.Request) {
@@ -507,7 +566,18 @@ func (h *Handler) GoogleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if tokenResp.StatusCode != http.StatusOK {
-		slog.Error("google oauth token exchange returned error", "status", tokenResp.StatusCode, "body", string(tokenBody))
+		// Never log the raw response body: it can echo request parameters
+		// and carry sensitive data. Only the structured error fields survive,
+		// and the description is truncated and redacted first.
+		googleError, googleErrorDescription := googleTokenErrorDetail(tokenBody)
+		attrs := []any{"status", tokenResp.StatusCode}
+		if googleError != "" {
+			attrs = append(attrs, "google_error", googleError)
+		}
+		if googleErrorDescription != "" {
+			attrs = append(attrs, "google_error_description", googleErrorDescription)
+		}
+		slog.Error("google oauth token exchange returned error", attrs...)
 		writeError(w, http.StatusBadRequest, "failed to exchange code with Google")
 		return
 	}
@@ -543,6 +613,14 @@ func (h *Handler) GoogleLogin(w http.ResponseWriter, r *http.Request) {
 
 	if gUser.Email == "" {
 		writeError(w, http.StatusBadRequest, "Google account has no email")
+		return
+	}
+
+	if !gUser.isEmailVerified() {
+		// Reject unverified addresses: otherwise an attacker controlling an
+		// unverified mailbox could link the account belonging to that email.
+		slog.Warn("google login rejected: email not verified", append(logger.RequestAttrs(r), "email", strings.ToLower(strings.TrimSpace(gUser.Email)))...)
+		writeError(w, http.StatusForbidden, "Google account email is not verified")
 		return
 	}
 

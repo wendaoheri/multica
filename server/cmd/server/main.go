@@ -187,9 +187,13 @@ func main() {
 		slog.Warn("no email backend configured (RESEND_API_KEY and SMTP_HOST both empty) — verification codes will be printed to the log instead of emailed.")
 	}
 	if os.Getenv("MULTICA_DEV_VERIFICATION_CODE") != "" {
-		if strings.EqualFold(strings.TrimSpace(os.Getenv("APP_ENV")), "production") {
+		enabledFlag := strings.ToLower(strings.TrimSpace(os.Getenv("MULTICA_DEV_VERIFICATION_CODE_ENABLED")))
+		switch {
+		case strings.EqualFold(strings.TrimSpace(os.Getenv("APP_ENV")), "production"):
 			slog.Warn("MULTICA_DEV_VERIFICATION_CODE is set but ignored because APP_ENV=production.")
-		} else {
+		case enabledFlag != "true" && enabledFlag != "1":
+			slog.Warn("MULTICA_DEV_VERIFICATION_CODE is set but ignored because MULTICA_DEV_VERIFICATION_CODE_ENABLED is not true/1. The fixed code is double-gated and stays off until both gates are open.")
+		default:
 			slog.Warn("MULTICA_DEV_VERIFICATION_CODE is enabled. Use it only for local development or private test instances.")
 		}
 	}

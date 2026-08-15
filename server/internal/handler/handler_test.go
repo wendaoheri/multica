@@ -2772,6 +2772,7 @@ func createVerificationCodeForTest(t *testing.T, email, code string) {
 
 func TestVerifyCodeRejectsDevCodeUnlessExplicitlyConfigured(t *testing.T) {
 	t.Setenv(devVerificationCodeEnv, "")
+	t.Setenv(devVerificationCodeEnabledEnv, "")
 	t.Setenv("APP_ENV", "")
 
 	const email = "dev-code-disabled-test@multica.ai"
@@ -2796,6 +2797,7 @@ func TestVerifyCodeRejectsDevCodeUnlessExplicitlyConfigured(t *testing.T) {
 
 func TestVerifyCodeAcceptsConfiguredDevCodeOutsideProduction(t *testing.T) {
 	t.Setenv(devVerificationCodeEnv, "888888")
+	t.Setenv(devVerificationCodeEnabledEnv, "true")
 	t.Setenv("APP_ENV", "development")
 
 	const email = "dev-code-enabled-test@multica.ai"
@@ -2821,6 +2823,8 @@ func TestVerifyCodeAcceptsConfiguredDevCodeOutsideProduction(t *testing.T) {
 
 func TestVerifyCodeRejectsConfiguredDevCodeInProduction(t *testing.T) {
 	t.Setenv(devVerificationCodeEnv, "888888")
+	// Even with the explicit enable flag set, the production gate wins.
+	t.Setenv(devVerificationCodeEnabledEnv, "true")
 	t.Setenv("APP_ENV", "production")
 
 	const email = "dev-code-production-test@multica.ai"
@@ -2840,6 +2844,33 @@ func TestVerifyCodeRejectsConfiguredDevCodeInProduction(t *testing.T) {
 	testHandler.VerifyCode(w, req)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("VerifyCode (production dev code): expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestVerifyCodeRejectsConfiguredDevCodeWithoutEnableFlag(t *testing.T) {
+	t.Setenv(devVerificationCodeEnv, "888888")
+	// The bypass is double-gated: a configured code outside production is
+	// still rejected unless MULTICA_DEV_VERIFICATION_CODE_ENABLED is truthy.
+	t.Setenv(devVerificationCodeEnabledEnv, "")
+	t.Setenv("APP_ENV", "development")
+
+	const email = "dev-code-no-flag-test@multica.ai"
+	ctx := context.Background()
+
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM verification_code WHERE email = $1`, email)
+	})
+
+	createVerificationCodeForTest(t, email, "123456")
+
+	w := httptest.NewRecorder()
+	var buf bytes.Buffer
+	json.NewEncoder(&buf).Encode(map[string]string{"email": email, "code": "888888"})
+	req := httptest.NewRequest("POST", "/auth/verify-code", &buf)
+	req.Header.Set("Content-Type", "application/json")
+	testHandler.VerifyCode(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("VerifyCode (dev code without enable flag): expected 400, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

@@ -2197,6 +2197,15 @@ func (h *Handler) ArchiveAgent(w http.ResponseWriter, r *http.Request) {
 
 	wsID := uuidToString(archived.WorkspaceID)
 	slog.Info("agent archived", append(logger.RequestAttrs(r), "agent_id", id, "workspace_id", wsID)...)
+
+	// PER-284 audit: archiving hides an agent (and cancels its tasks); a
+	// workspace-owner-grade action worth a forensic trail.
+	arcActorType, arcActorID := h.resolveActor(r, userID, wsID)
+	h.recordAudit(r, archived.WorkspaceID, arcActorType, arcActorID, auditActionAgentArchived, map[string]any{
+		"agent_id":   uuidToString(archived.ID),
+		"agent_name": archived.Name,
+	})
+
 	resp := h.agentToResponse(archived)
 	if err := h.attachAgentSkills(r.Context(), &resp, archived.ID); err != nil {
 		slog.Warn("load agent skills after archive failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)
@@ -2232,6 +2241,15 @@ func (h *Handler) RestoreAgent(w http.ResponseWriter, r *http.Request) {
 
 	wsID := uuidToString(restored.WorkspaceID)
 	slog.Info("agent restored", append(logger.RequestAttrs(r), "agent_id", id, "workspace_id", wsID)...)
+
+	// PER-284 audit: symmetric with agent_archived — restoring re-enables
+	// an agent's task surface.
+	resActorType, resActorID := h.resolveActor(r, requestUserID(r), wsID)
+	h.recordAudit(r, restored.WorkspaceID, resActorType, resActorID, auditActionAgentRestored, map[string]any{
+		"agent_id":   uuidToString(restored.ID),
+		"agent_name": restored.Name,
+	})
+
 	resp := h.agentToResponse(restored)
 	if err := h.attachAgentSkills(r.Context(), &resp, restored.ID); err != nil {
 		slog.Warn("load agent skills after restore failed", append(logger.RequestAttrs(r), "error", err, "agent_id", id)...)

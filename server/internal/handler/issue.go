@@ -928,6 +928,13 @@ func (h *Handler) ListIssues(w http.ResponseWriter, r *http.Request) {
 			resp[i].Labels = &labels
 		}
 
+		// PER-284 audit: open_only returns the workspace's entire open-issue
+		// set with no limit — the one list branch shaped like a bulk export.
+		// Deduplicated per actor (recordBulkExportAudit).
+		h.recordBulkExportAudit(r, wsUUID, "GET /api/issues?open_only=true", map[string]any{
+			"total": len(resp),
+		})
+
 		writeJSON(w, http.StatusOK, map[string]any{
 			"issues": resp,
 			"total":  len(resp),
@@ -3765,6 +3772,22 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 	h.notifyParentsOfBatchChildDone(r.Context(), childDoneCompleted)
 
 	slog.Info("batch update issues", append(logger.RequestAttrs(r), "count", updated)...)
+
+	// PER-284 audit: bulk mutation is a high-impact surface; record the
+	// requested/updated counts and which fields the batch touched.
+	if updated > 0 {
+		changedFields := make([]string, 0, len(rawUpdates))
+		for field := range rawUpdates {
+			changedFields = append(changedFields, field)
+		}
+		batchActorType, batchActorID := h.resolveActor(r, userID, workspaceID)
+		h.recordAudit(r, wsUUID, batchActorType, batchActorID, auditActionIssuesBatchUpdated, map[string]any{
+			"requested": len(req.IssueIDs),
+			"updated":   updated,
+			"fields":    changedFields,
+		})
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{"updated": updated})
 }
 
@@ -3795,6 +3818,7 @@ func (h *Handler) BatchDeleteIssues(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	deleted := 0
+	deletedIDs := make([]string, 0, min(len(req.IssueIDs), auditDetailsIDCap))
 	for _, issueID := range req.IssueIDs {
 		issueUUID, err := util.ParseUUID(issueID)
 		if err != nil {
@@ -3822,9 +3846,25 @@ func (h *Handler) BatchDeleteIssues(w http.ResponseWriter, r *http.Request) {
 		// Always emit the resolved UUID — frontend caches key by UUID.
 		actorType, actorID := h.resolveActor(r, userID, workspaceID)
 		h.publish(protocol.EventIssueDeleted, workspaceID, actorType, actorID, map[string]any{"issue_id": uuidToString(issue.ID)})
+		if len(deletedIDs) < auditDetailsIDCap {
+			deletedIDs = append(deletedIDs, uuidToString(issue.ID))
+		}
 		deleted++
 	}
 
 	slog.Info("batch delete issues", append(logger.RequestAttrs(r), "count", deleted)...)
+
+	// PER-284 audit: bulk deletion is irreversible; record it with a capped
+	// id sample (exact totals live in requested/deleted).
+	if deleted > 0 {
+		batchActorType, batchActorID := h.resolveActor(r, userID, workspaceID)
+		h.recordAudit(r, wsUUID, batchActorType, batchActorID, auditActionIssuesBatchDeleted, map[string]any{
+			"requested": len(req.IssueIDs),
+			"deleted":   deleted,
+			"issue_ids": deletedIDs,
+			"id_capped": len(deletedIDs) < deleted,
+		})
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": deleted})
 }

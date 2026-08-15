@@ -143,6 +143,15 @@ func (h *Handler) CreateInvitation(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("invitation created", append(logger.RequestAttrs(r), "invitation_id", uuidToString(inv.ID), "workspace_id", workspaceID, "email", email, "role", role)...)
 
+	// PER-284 audit: invitations grant future workspace access; keep a
+	// trail of who was invited, at which role, by whom.
+	invActorType, invActorID := h.resolveActor(r, requestUserID(r), workspaceID)
+	h.recordAudit(r, requester.WorkspaceID, invActorType, invActorID, auditActionInvitationCreated, map[string]any{
+		"invitation_id": uuidToString(inv.ID),
+		"invitee_email": email,
+		"role":          role,
+	})
+
 	resp := invitationToResponse(inv)
 
 	// Notify the invitee in real time if they are a registered user.
@@ -247,6 +256,15 @@ func (h *Handler) RevokeInvitation(w http.ResponseWriter, r *http.Request) {
 	}
 
 	slog.Info("invitation revoked", "invitation_id", invitationID, "workspace_id", workspaceID)
+
+	// PER-284 audit: revoking an invitation is an access-control change;
+	// record it alongside the creation trail.
+	revActorType, revActorID := h.resolveActor(r, requestUserID(r), workspaceID)
+	h.recordAudit(r, inv.WorkspaceID, revActorType, revActorID, auditActionInvitationRevoked, map[string]any{
+		"invitation_id": uuidToString(inv.ID),
+		"invitee_email": inv.InviteeEmail,
+		"role":          inv.Role,
+	})
 
 	userID := requestUserID(r)
 	h.publish(protocol.EventInvitationRevoked, uuidToString(workspaceUUID), "member", userID, map[string]any{

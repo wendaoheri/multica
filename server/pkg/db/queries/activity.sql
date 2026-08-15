@@ -44,6 +44,21 @@ SELECT EXISTS (
     AND details->>'task_id' = @task_id::text
 ) AS exists;
 
+-- name: ExistsRecentActivityByActorAction :one
+-- Audit dedupe probe: has this actor already recorded this action in this
+-- workspace since $4? Used to collapse high-frequency bulk-read requests
+-- (table paging behind CSV export) into at most one bulk_export audit row
+-- per actor per window. Served by idx_activity_log_ws_actor_action_created
+-- (migration 319).
+SELECT EXISTS (
+  SELECT 1
+  FROM activity_log
+  WHERE workspace_id = $1
+    AND actor_id = $2
+    AND action = $3
+    AND created_at >= $4
+) AS exists;
+
 -- name: CountAssigneeChangesByActor :many
 -- Count how many times a user assigned each target via assignee_changed activities.
 SELECT

@@ -472,6 +472,16 @@ SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
 		}
 	}
 
+	// PER-284 audit: this endpoint is what the client-side CSV export walks
+	// page by page, so it is the platform's effective bulk-export surface.
+	// One deduplicated row per actor per window, not one per page. Uses
+	// baseHandler (not the snapshot h) because the snapshot transaction is
+	// already committed.
+	baseHandler.recordBulkExportAudit(r, compiled.workspaceID, "POST /api/issues/table/rows", map[string]any{
+		"rows_returned": len(responseRows),
+		"has_cursor":    cursor != nil,
+	})
+
 	response := issueTableRowsResponse{
 		QueryFingerprint: compiled.fingerprint,
 		GroupKey:         groupKey,

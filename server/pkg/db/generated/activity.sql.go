@@ -97,6 +97,41 @@ func (q *Queries) CreateActivity(ctx context.Context, arg CreateActivityParams) 
 	return i, err
 }
 
+const existsRecentActivityByActorAction = `-- name: ExistsRecentActivityByActorAction :one
+SELECT EXISTS (
+  SELECT 1
+  FROM activity_log
+  WHERE workspace_id = $1
+    AND actor_id = $2
+    AND action = $3
+    AND created_at >= $4
+) AS exists
+`
+
+type ExistsRecentActivityByActorActionParams struct {
+	WorkspaceID pgtype.UUID        `json:"workspace_id"`
+	ActorID     pgtype.UUID        `json:"actor_id"`
+	Action      string             `json:"action"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+}
+
+// Audit dedupe probe: has this actor already recorded this action in this
+// workspace since $4? Used to collapse high-frequency bulk-read requests
+// (table paging behind CSV export) into at most one bulk_export audit row
+// per actor per window. Served by idx_activity_log_ws_actor_action_created
+// (migration 319).
+func (q *Queries) ExistsRecentActivityByActorAction(ctx context.Context, arg ExistsRecentActivityByActorActionParams) (bool, error) {
+	row := q.db.QueryRow(ctx, existsRecentActivityByActorAction,
+		arg.WorkspaceID,
+		arg.ActorID,
+		arg.Action,
+		arg.CreatedAt,
+	)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const getActivity = `-- name: GetActivity :one
 SELECT id, workspace_id, issue_id, actor_type, actor_id, action, details, created_at FROM activity_log
 WHERE id = $1

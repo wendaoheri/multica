@@ -673,6 +673,7 @@ func (h *Handler) UpdateMember(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	fromRole := target.Role
 	updatedMember, err := h.Queries.UpdateMemberRole(r.Context(), db.UpdateMemberRoleParams{
 		ID:   target.ID,
 		Role: role,
@@ -683,6 +684,16 @@ func (h *Handler) UpdateMember(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.MembershipCache.Invalidate(r.Context(), uuidToString(target.UserID), workspaceID)
+
+	// PER-284 audit: role changes are the workspace's privilege-escalation
+	// surface; record who changed whose role, from what to what.
+	actorType, actorID := h.resolveActor(r, requestUserID(r), workspaceID)
+	h.recordAudit(r, requester.WorkspaceID, actorType, actorID, auditActionMemberRoleChanged, map[string]any{
+		"member_id": uuidToString(target.ID),
+		"user_id":   uuidToString(target.UserID),
+		"from_role": fromRole,
+		"to_role":   role,
+	})
 
 	user, err := h.Queries.GetUser(r.Context(), updatedMember.UserID)
 	if err != nil {
@@ -742,6 +753,15 @@ func (h *Handler) DeleteMember(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.MembershipCache.Invalidate(r.Context(), uuidToString(target.UserID), workspaceID)
+
+	// PER-284 audit: member removal revokes all workspace access; keep a
+	// trail of who removed whom (and the removed member's last role).
+	actorType, actorID := h.resolveActor(r, requesterUserID, workspaceID)
+	h.recordAudit(r, requester.WorkspaceID, actorType, actorID, auditActionMemberRemoved, map[string]any{
+		"member_id": uuidToString(target.ID),
+		"user_id":   uuidToString(target.UserID),
+		"role":      target.Role,
+	})
 
 	wsIDStr := uuidToString(requester.WorkspaceID)
 	logRevocation(result, wsIDStr, uuidToString(target.UserID))
@@ -1126,6 +1146,13 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Capture identity metadata for the post-delete audit line before the
+	// teardown erases the workspace row (PER-284).
+	auditWorkspaceName, auditWorkspaceSlug := "", ""
+	if ws, err := h.Queries.GetWorkspace(r.Context(), requester.WorkspaceID); err == nil {
+		auditWorkspaceName, auditWorkspaceSlug = ws.Name, ws.Slug
+	}
+
 	// Invalidate membership cache for all workspace members before deletion.
 	// After CASCADE deletes the member rows, cache entries become harmless
 	// orphans (downstream lookups for the deleted workspace will fail), but
@@ -1307,7 +1334,20 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	slog.Info("workspace deleted", append(logger.RequestAttrs(r), "workspace_id", workspaceID)...)
+	// PER-284 audit: workspace deletion cannot be recorded in activity_log —
+	// the teardown deletes the workspace's activity rows in the same
+	// transaction. This structured log line is the durable record instead:
+	// it ships off-server via log shipping and is grep-able by the
+	// audit_event marker. Do not drop fields: they are the post-incident
+	// identity of what was destroyed and by whom.
+	slog.Info("audit_event",
+		append(logger.RequestAttrs(r),
+			"action", "workspace_deleted",
+			"workspace_id", workspaceID,
+			"workspace_name", auditWorkspaceName,
+			"workspace_slug", auditWorkspaceSlug,
+			"actor_user_id", requestUserID(r),
+		)...)
 	h.publish(protocol.EventWorkspaceDeleted, workspaceID, "member", requestUserID(r), map[string]any{
 		"workspace_id": workspaceID,
 	})

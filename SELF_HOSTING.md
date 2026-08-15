@@ -458,6 +458,15 @@ docker compose -f docker-compose.selfhost.yml up -d
 Pin `MULTICA_IMAGE_TAG` in `.env` to an exact version like `v0.2.4` if you want to stay on a specific release. Migrations run automatically on backend startup.
 If the selected GHCR tag has not been published yet, fall back to `make selfhost-build` or `docker compose -f docker-compose.selfhost.yml -f docker-compose.selfhost.build.yml up -d --build`.
 
+> **Upgrading from an image that ran the backend as root?** The backend now runs as a dedicated `multica` user (UID/GID 1000). A `backend_uploads` volume created by an older image is still root-owned, so run a one-time chown before starting the new image, or attachment writes fail with permission errors:
+>
+> ```bash
+> docker volume inspect multica_backend_uploads   # confirm the volume name
+> docker run --rm -v multica_backend_uploads:/data alpine chown -R 1000:1000 /data
+> ```
+>
+> Fresh installations are unaffected: the image pre-creates `/app/data/uploads`, so Docker initializes new volumes with the right ownership.
+
 > **Upgrading from `v0.3.4` to `v0.3.5+` fails with `refusing to drop legacy daily rollups: ...`?** That's migration `103`'s fail-closed guard: it requires `task_usage_hourly` to be seeded before the legacy daily rollups are dropped. As of MUL-2957 `migrate up` runs that backfill automatically right before applying `103`, so the upgrade completes in a single invocation. If you are still on a pre-MUL-2957 binary or the auto-hook fails, run `backfill_task_usage_hourly` manually first, then re-run the upgrade. Full instructions in [Advanced Configuration → Usage Dashboard Rollup](SELF_HOSTING_ADVANCED.md#usage-dashboard-rollup).
 
 ---

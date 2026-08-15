@@ -27,6 +27,11 @@ FROM alpine:3.21
 
 RUN apk add --no-cache ca-certificates tzdata
 
+# Dedicated non-root runtime user. UID/GID 1000 must stay stable: upload
+# volumes upgraded from older root-running images are chowned to these ids.
+RUN addgroup -g 1000 multica && \
+    adduser -D -u 1000 -G multica -h /home/multica -s /sbin/nologin multica
+
 WORKDIR /app
 
 COPY --from=builder /src/server/bin/server .
@@ -38,6 +43,13 @@ COPY server/migrations/ ./migrations/
 COPY LICENSE NOTICE ./
 COPY docker/entrypoint.sh .
 RUN sed -i 's/\r$//' entrypoint.sh && chmod +x entrypoint.sh
+
+# Pre-create the default local upload directory (LOCAL_UPLOAD_DIR default,
+# resolved against WORKDIR) so freshly initialized named volumes such as the
+# selfhost compose `backend_uploads` inherit the non-root owner.
+RUN mkdir -p data/uploads && chown -R multica:multica data
+
+USER multica
 
 EXPOSE 8080
 

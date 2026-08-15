@@ -26,7 +26,8 @@ func isTerminal(f *os.File) bool {
 
 // Init initializes the global slog logger. Colors are enabled when stderr
 // is a terminal and disabled otherwise. Reads LOG_LEVEL env var (debug,
-// info, warn, error). Default: debug.
+// info, warn, error). Default: debug. Every record passes through the
+// secret-redacting handler before reaching the sink (PER-284).
 func Init() {
 	level := parseLevel(os.Getenv("LOG_LEVEL"))
 	handler := tint.NewHandler(os.Stderr, &tint.Options{
@@ -34,7 +35,7 @@ func Init() {
 		TimeFormat: "15:04:05.000",
 		NoColor:    !isTerminal(os.Stderr),
 	})
-	slog.SetDefault(slog.New(handler))
+	slog.SetDefault(slog.New(NewRedactingHandler(handler)))
 }
 
 // NewLogger creates a named slog logger. Colors follow the same
@@ -47,7 +48,7 @@ func NewLogger(component string) *slog.Logger {
 		TimeFormat: "15:04:05.000",
 		NoColor:    !isTerminal(os.Stderr),
 	})
-	return slog.New(handler).With("component", component)
+	return slog.New(NewRedactingHandler(handler)).With("component", component)
 }
 
 // StderrIsTerminal reports whether this process's stderr is attached to a
@@ -73,7 +74,7 @@ func NewWriterLoggerDefault(component string, w io.Writer) *slog.Logger {
 		TimeFormat: "15:04:05.000",
 		NoColor:    true,
 	})
-	base := slog.New(handler)
+	base := slog.New(NewRedactingHandler(handler))
 	slog.SetDefault(base)
 	return base.With("component", component)
 }

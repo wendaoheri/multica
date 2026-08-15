@@ -99,7 +99,8 @@ Kubernetes で shutdown hold を設定する場合、`terminationGracePeriodSeco
 | `ALLOWED_EMAILS` | 空 | 登録を許可する完全なメールアドレス。カンマ区切り |
 | `ALLOWED_EMAIL_DOMAINS` | 空 | 登録を許可するメールドメイン。カンマ区切り |
 | `DISABLE_WORKSPACE_CREATION` | `false` | すべてのユーザーのワークスペース新規作成を禁止。owner/admin の例外はありません |
-| `MULTICA_DEV_VERIFICATION_CODE` | 空 | 非 production 環境で使う固定 6 桁のテスト認証コード |
+| `MULTICA_DEV_VERIFICATION_CODE` | 空 | 非 production 環境で使う固定 6 桁のテスト認証コード。二重ゲート: 非 production の `APP_ENV` と `MULTICA_DEV_VERIFICATION_CODE_ENABLED=true` の両方が必要 |
+| `MULTICA_DEV_VERIFICATION_CODE_ENABLED` | 空 | 固定テスト認証コードの明示的なスイッチ。`true` または `1` のみ有効化 |
 
 allowlist の正確な判定順序は[ログインとサインアップ](/auth-setup#サインアップ制限)を参照してください。
 

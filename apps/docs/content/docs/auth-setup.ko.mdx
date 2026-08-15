@@ -68,12 +68,13 @@ SMTP_EHLO_NAME=mail.example.com
 ```dotenv
 APP_ENV=development
 MULTICA_DEV_VERIFICATION_CODE=888888
+MULTICA_DEV_VERIFICATION_CODE_ENABLED=true
 ```
 
-인증 코드는 6자리 숫자여야 합니다. `APP_ENV=production`에서는 고정 코드가 무시됩니다.
+인증 코드는 6자리 숫자여야 합니다. 고정 코드는 이중으로 게이트됩니다: `APP_ENV`가 non-production이고 `MULTICA_DEV_VERIFICATION_CODE_ENABLED=true`일 때만 작동합니다.
 
 <Callout type="warning">
-공개 인터넷에 노출된 인스턴스에서 고정 인증 코드를 사용하지 마세요. 프로덕션 환경에서는 `APP_ENV=production`을 사용하고 `MULTICA_DEV_VERIFICATION_CODE`를 비워 둡니다.
+공개 인터넷에 노출된 인스턴스에서 고정 인증 코드를 사용하지 마세요. 프로덕션 환경에서는 `APP_ENV=production`을 사용하고 `MULTICA_DEV_VERIFICATION_CODE`를 비워 두세요(`MULTICA_DEV_VERIFICATION_CODE_ENABLED` 미설정).
 </Callout>
 
 ## Google 로그인

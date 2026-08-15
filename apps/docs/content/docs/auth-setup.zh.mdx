@@ -68,12 +68,13 @@ SMTP_EHLO_NAME=mail.example.com
 ```dotenv
 APP_ENV=development
 MULTICA_DEV_VERIFICATION_CODE=888888
+MULTICA_DEV_VERIFICATION_CODE_ENABLED=true
 ```
 
-验证码必须是 6 位数字。`APP_ENV=production` 时固定验证码会被忽略。
+验证码必须是 6 位数字。固定验证码有双重门控：仅当 `APP_ENV` 非 production 且 `MULTICA_DEV_VERIFICATION_CODE_ENABLED=true` 时才生效。
 
 <Callout type="warning">
-不要在公网实例中启用固定验证码。生产环境的组合是 `APP_ENV=production` 加空的 `MULTICA_DEV_VERIFICATION_CODE`。
+不要在公网实例中启用固定验证码。生产环境的组合是 `APP_ENV=production` 加空的 `MULTICA_DEV_VERIFICATION_CODE`（或不设置 `MULTICA_DEV_VERIFICATION_CODE_ENABLED`）。
 </Callout>
 
 ## Google 登录

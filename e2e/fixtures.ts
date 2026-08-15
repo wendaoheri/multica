@@ -80,7 +80,15 @@ export class TestApiClient {
         throw new Error(`No verification code found for ${email}`);
       }
 
-      const configuredDevCode = process.env.MULTICA_DEV_VERIFICATION_CODE?.trim();
+      // The fixed dev code is double-gated on the server: only use it here
+      // when the explicit enable flag is truthy too, otherwise fall back to
+      // the freshly generated DB code.
+      const devCodeEnabled = ["true", "1"].includes(
+        process.env.MULTICA_DEV_VERIFICATION_CODE_ENABLED?.trim().toLowerCase() ?? "",
+      );
+      const configuredDevCode = devCodeEnabled
+        ? process.env.MULTICA_DEV_VERIFICATION_CODE?.trim()
+        : undefined;
       const code = configuredDevCode || result.rows[0].code;
 
       // Step 3: Verify code to get JWT

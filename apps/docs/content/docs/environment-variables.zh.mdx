@@ -99,7 +99,8 @@ MULTICA_PUBLIC_URL=https://api.multica.example.com
 | `ALLOWED_EMAILS` | 空 | 允许注册的完整邮箱，逗号分隔 |
 | `ALLOWED_EMAIL_DOMAINS` | 空 | 允许注册的邮箱域名，逗号分隔 |
 | `DISABLE_WORKSPACE_CREATION` | `false` | 禁止所有用户新建工作区；没有 owner/admin 例外 |
-| `MULTICA_DEV_VERIFICATION_CODE` | 空 | 非 production 环境使用的固定 6 位测试验证码 |
+| `MULTICA_DEV_VERIFICATION_CODE` | 空 | 非 production 环境使用的固定 6 位测试验证码；双重门控，需同时满足非 production 的 `APP_ENV` 和 `MULTICA_DEV_VERIFICATION_CODE_ENABLED=true` |
+| `MULTICA_DEV_VERIFICATION_CODE_ENABLED` | 空 | 固定测试验证码的显式开关；仅 `true` 或 `1` 生效 |
 
 白名单的准确判断顺序见[登录与注册](/auth-setup#注册范围控制)。
 

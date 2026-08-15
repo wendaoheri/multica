@@ -408,7 +408,9 @@ done
 #### 2. Create a test user and token (automated auth)
 
 For deterministic local automation, set `MULTICA_DEV_VERIFICATION_CODE=888888`
-in your env file before starting the backend:
+and `MULTICA_DEV_VERIFICATION_CODE_ENABLED=true` in your env file before
+starting the backend (the fixed code is double-gated and needs both, with a
+non-production `APP_ENV`):
 
 ```bash
 curl -s -X POST "$SERVER/auth/send-code" \
@@ -512,8 +514,9 @@ This automatically:
 4. Connects to the local backend
 
 Login in the Desktop UI with `dev@localhost` and the generated code from the
-backend logs. If you set `MULTICA_DEV_VERIFICATION_CODE=888888` before starting
-the backend, you can use `888888` instead.
+backend logs. If you set `MULTICA_DEV_VERIFICATION_CODE=888888` and
+`MULTICA_DEV_VERIFICATION_CODE_ENABLED=true` before starting the backend, you
+can use `888888` instead.
 
 If the backend runs on a non-default port (worktree), create
 `apps/desktop/.env.development.local`:

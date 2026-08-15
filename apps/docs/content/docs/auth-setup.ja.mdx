@@ -68,12 +68,13 @@ SMTP_EHLO_NAME=mail.example.com
 ```dotenv
 APP_ENV=development
 MULTICA_DEV_VERIFICATION_CODE=888888
+MULTICA_DEV_VERIFICATION_CODE_ENABLED=true
 ```
 
-認証コードは 6 桁の数字である必要があります。`APP_ENV=production` のときは固定コードは無視されます。
+認証コードは 6 桁の数字である必要があります。固定コードは二重にゲートされています。`APP_ENV` が非 production かつ `MULTICA_DEV_VERIFICATION_CODE_ENABLED=true` の場合のみ機能します。
 
 <Callout type="warning">
-公開インスタンスで固定認証コードを有効にしないでください。プロダクションの組み合わせは `APP_ENV=production` と空の `MULTICA_DEV_VERIFICATION_CODE` です。
+公開インスタンスで固定認証コードを有効にしないでください。プロダクションの組み合わせは `APP_ENV=production` と空の `MULTICA_DEV_VERIFICATION_CODE`（または `MULTICA_DEV_VERIFICATION_CODE_ENABLED` 未設定）です。
 </Callout>
 
 ## Google ログイン

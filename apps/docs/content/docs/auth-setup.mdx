@@ -68,12 +68,13 @@ Local automated tests can set a fixed verification code:
 ```dotenv
 APP_ENV=development
 MULTICA_DEV_VERIFICATION_CODE=888888
+MULTICA_DEV_VERIFICATION_CODE_ENABLED=true
 ```
 
-The code must be 6 digits. The fixed code is ignored when `APP_ENV=production`.
+The code must be 6 digits. The fixed code is double-gated: it only works when `APP_ENV` is non-production **and** `MULTICA_DEV_VERIFICATION_CODE_ENABLED=true`.
 
 <Callout type="warning">
-Do not enable a fixed code on a publicly reachable instance. The production combination is `APP_ENV=production` with an empty `MULTICA_DEV_VERIFICATION_CODE`.
+Do not enable a fixed code on a publicly reachable instance. The production combination is `APP_ENV=production` with an empty `MULTICA_DEV_VERIFICATION_CODE` (or `MULTICA_DEV_VERIFICATION_CODE_ENABLED` unset).
 </Callout>
 
 ## Google sign-in

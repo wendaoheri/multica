@@ -99,7 +99,8 @@ SMTP takes priority over Resend whenever `SMTP_HOST` is non-empty.
 | `ALLOWED_EMAILS` | empty | Full email addresses allowed to sign up, comma-separated |
 | `ALLOWED_EMAIL_DOMAINS` | empty | Email domains allowed to sign up, comma-separated |
 | `DISABLE_WORKSPACE_CREATION` | `false` | Blocks all users from creating workspaces; no owner/admin exception |
-| `MULTICA_DEV_VERIFICATION_CODE` | empty | Fixed 6-digit test code for non-production environments |
+| `MULTICA_DEV_VERIFICATION_CODE` | empty | Fixed 6-digit test code; double-gated — requires a non-production `APP_ENV` and `MULTICA_DEV_VERIFICATION_CODE_ENABLED=true` |
+| `MULTICA_DEV_VERIFICATION_CODE_ENABLED` | empty | Explicit switch for the fixed test code; only `true` or `1` enables it |
 
 For the exact allowlist evaluation order, see [Sign-in and signup](/auth-setup#signup-restrictions).
 

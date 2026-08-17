@@ -13,9 +13,11 @@ import (
 	"github.com/multica-ai/multica/server/pkg/protocol"
 )
 
-// isAssignmentRecipientType reports whether an assignee can own a subscriber
-// or inbox row. Squads are routing objects whose work runs through the leader;
-// they are not user identities and have no inbox to consume.
+// isAssignmentRecipientType reports whether an identity can own a subscriber
+// or inbox row — the guard for both assignee writes and @mention writes.
+// Squads are routing objects whose work runs through the leader; issue links
+// and @all/@squad broadcasts are not identities at all. None of them have an
+// inbox to consume, and issue_subscriber.user_type only allows member/agent.
 func isAssignmentRecipientType(assigneeType string) bool {
 	return assigneeType == "member" || assigneeType == "agent"
 }
@@ -52,9 +54,16 @@ func registerSubscriberListeners(bus *events.Bus, pool *pgxpool.Pool) {
 			addSubscriber(bus, queries, e.WorkspaceID, issue.ID, *issue.AssigneeType, *issue.AssigneeID, "assignee")
 		}
 
-		// Subscribe @mentioned users in description
+		// Subscribe @mentioned users in description. Only member/agent mentions
+		// may become subscriber rows: issue links and @all/@squad broadcasts are
+		// not identities, writing them violates the user_type CHECK, and an @all
+		// mention's literal "all" ID panics the UUID parse — aborting every
+		// subscriber write after it in this handler, including the delegated one.
 		if issue.Description != nil && *issue.Description != "" {
 			for _, m := range parseMentions(*issue.Description) {
+				if !isAssignmentRecipientType(m.Type) {
+					continue
+				}
 				addSubscriber(bus, queries, e.WorkspaceID, issue.ID, m.Type, m.ID, "mentioned")
 			}
 		}
@@ -96,9 +105,13 @@ func registerSubscriberListeners(bus *events.Bus, pool *pgxpool.Pool) {
 					}
 				}
 				for _, m := range newMentions {
-					if !prevMentioned[m.Type+":"+m.ID] {
-						addSubscriber(bus, queries, e.WorkspaceID, issue.ID, m.Type, m.ID, "mentioned")
+					// Same identity filter as issue:created: non-identity mentions
+					// (issue links, @all, @squad) must never reach the subscriber
+					// write.
+					if prevMentioned[m.Type+":"+m.ID] || !isAssignmentRecipientType(m.Type) {
+						continue
 					}
+					addSubscriber(bus, queries, e.WorkspaceID, issue.ID, m.Type, m.ID, "mentioned")
 				}
 			}
 		}

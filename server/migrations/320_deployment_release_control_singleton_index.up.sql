@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX CONCURRENTLY idx_deployment_release_control_singleton ON deployment_release_control (singleton);

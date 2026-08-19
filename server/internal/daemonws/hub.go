@@ -312,8 +312,9 @@ func (h *Hub) HandleWebSocket(w http.ResponseWriter, r *http.Request, identity C
 }
 
 // NotifyTaskAvailable sends a best-effort wakeup to daemons watching runtimeID.
-func (h *Hub) NotifyTaskAvailable(runtimeID, taskID string) {
+func (h *Hub) NotifyTaskAvailable(runtimeID, taskID string) error {
 	h.notifyTaskAvailable(runtimeID, taskID, "")
+	return nil
 }
 
 // NotifyRuntimeProfilesChanged asks connected daemons in workspaceID to pull

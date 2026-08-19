@@ -1,0 +1,116 @@
+name: multica-transition
+
+x-backend: &backend
+  restart: unless-stopped
+  env_file:
+    - ${MULTICA_RELEASE_ENV_FILE:?set MULTICA_RELEASE_ENV_FILE}
+  environment: &backend-env
+    DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
+    REDIS_URL: ${REDIS_URL:?set REDIS_URL}
+    MULTICA_AUTO_MIGRATE: "false"
+    REALTIME_RELAY_MODE: sharded
+  volumes:
+    - uploads:/app/data/uploads
+  networks:
+    - state
+
+x-frontend: &frontend
+  restart: unless-stopped
+  networks:
+    - state
+
+services:
+  blue-web:
+    <<: *backend
+    image: ${BLUE_BACKEND_IMAGE:?pin BLUE_BACKEND_IMAGE by digest}
+    environment:
+      <<: *backend-env
+      MULTICA_PROCESS_ROLE: web
+      PORT: "8080"
+    ports:
+      - "127.0.0.1:${BLUE_WEB_PORT:-8080}:8080"
+
+  blue-worker:
+    <<: *backend
+    image: ${BLUE_BACKEND_IMAGE:?pin BLUE_BACKEND_IMAGE by digest}
+    environment:
+      <<: *backend-env
+      MULTICA_PROCESS_ROLE: worker
+      MULTICA_RELEASE_GENERATION: ${BLUE_GENERATION:?set BLUE_GENERATION}
+      MULTICA_WORKER_OWNER: ${BLUE_WORKER_OWNER:?set BLUE_WORKER_OWNER}
+      MULTICA_WORKER_ADMIN_ADDR: 0.0.0.0:9091
+      MULTICA_WORKER_ADMIN_TOKEN: ${MULTICA_WORKER_ADMIN_TOKEN:?set MULTICA_WORKER_ADMIN_TOKEN}
+    # The container listener is isolated; the only published path is loopback.
+    ports:
+      - "127.0.0.1:${BLUE_WORKER_ADMIN_PORT:-19091}:9091"
+
+  blue-frontend:
+    <<: *frontend
+    image: ${BLUE_WEB_IMAGE:?pin BLUE_WEB_IMAGE by digest}
+    environment:
+      HOSTNAME: 0.0.0.0
+      REMOTE_API_URL: http://blue-web:8080
+    ports:
+      - "127.0.0.1:${BLUE_FRONTEND_PORT:-3000}:3000"
+
+  green-web:
+    <<: *backend
+    image: ${GREEN_BACKEND_IMAGE:?pin GREEN_BACKEND_IMAGE by digest}
+    environment:
+      <<: *backend-env
+      MULTICA_PROCESS_ROLE: web
+      PORT: "8080"
+    ports:
+      - "127.0.0.1:${GREEN_WEB_PORT:-8081}:8080"
+
+  green-worker:
+    <<: *backend
+    image: ${GREEN_BACKEND_IMAGE:?pin GREEN_BACKEND_IMAGE by digest}
+    environment:
+      <<: *backend-env
+      MULTICA_PROCESS_ROLE: worker
+      MULTICA_RELEASE_GENERATION: ${GREEN_GENERATION:?set GREEN_GENERATION}
+      MULTICA_WORKER_OWNER: ${GREEN_WORKER_OWNER:?set GREEN_WORKER_OWNER}
+      MULTICA_WORKER_ADMIN_ADDR: 0.0.0.0:9091
+      MULTICA_WORKER_ADMIN_TOKEN: ${MULTICA_WORKER_ADMIN_TOKEN:?set MULTICA_WORKER_ADMIN_TOKEN}
+    ports:
+      - "127.0.0.1:${GREEN_WORKER_ADMIN_PORT:-19092}:9091"
+
+  green-frontend:
+    <<: *frontend
+    image: ${GREEN_WEB_IMAGE:?pin GREEN_WEB_IMAGE by digest}
+    environment:
+      HOSTNAME: 0.0.0.0
+      REMOTE_API_URL: http://green-web:8080
+    ports:
+      - "127.0.0.1:${GREEN_FRONTEND_PORT:-3001}:3000"
+
+  migrator:
+    <<: *backend
+    profiles: ["migration"]
+    image: ${MIGRATOR_IMAGE:?pin MIGRATOR_IMAGE by digest}
+    restart: "no"
+    environment:
+      <<: *backend-env
+      PGOPTIONS: -c lock_timeout=3s -c statement_timeout=15min
+    volumes:
+      - ${RELEASE_ARTIFACT_DIR:?set RELEASE_ARTIFACT_DIR}:/release:ro
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - >-
+        ./releasectl verify-manifest
+        --manifest /release/manifest.json
+        --artifact-dir /release
+        --migration-dir /app/migrations
+        --check-database
+        && timeout 1200 ./migrate up
+
+volumes:
+  uploads:
+    external: true
+    name: ${MULTICA_UPLOADS_VOLUME:?set MULTICA_UPLOADS_VOLUME}
+
+networks:
+  state:
+    external: true
+    name: ${MULTICA_STATE_NETWORK:?set MULTICA_STATE_NETWORK}

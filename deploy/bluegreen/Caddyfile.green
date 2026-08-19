@@ -1,0 +1,20 @@
+# Managed PER-376 green upstream fragment. It intentionally contains one
+# upstream per route: this release contract uses hard cutover, not random canary.
+@api path /api/* /auth/* /ws* /health /healthz /readyz
+handle @api {
+	reverse_proxy 127.0.0.1:8081 {
+		health_uri /readyz
+		health_interval 5s
+		health_timeout 2s
+		health_passes 2
+		health_fails 2
+		fail_duration 30s
+		max_fails 2
+		flush_interval -1
+		stream_close_delay 5m
+		stream_timeout 24h
+	}
+}
+handle {
+	reverse_proxy 127.0.0.1:3001
+}

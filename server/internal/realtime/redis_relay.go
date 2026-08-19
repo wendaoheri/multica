@@ -279,10 +279,12 @@ func (r *RedisRelay) publish(scopeType, scopeID, exclude string, frame []byte) {
 	defer cancel()
 	if err := r.writeRDB.XAdd(ctx, args).Err(); err != nil {
 		M.RedisXAddErrors.Add(1)
+		M.RedisConnected.Store(false)
 		M.SetRedisLastError(err.Error())
 		slog.Warn("realtime/redis: XADD failed", "error", err, "scope", scopeType, "scope_id", scopeID)
 		return
 	}
+	M.RedisConnected.Store(true)
 	M.RedisXAddTotal.Add(1)
 	M.RedisLastXAddLagMicros.Store(time.Since(start).Microseconds())
 }

@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS idx_deployment_release_control_singleton;

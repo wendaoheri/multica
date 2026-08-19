@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -14,12 +15,12 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/daemonws"
+	"github.com/multica-ai/multica/server/internal/deployment"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/handler"
 	"github.com/multica-ai/multica/server/internal/logger"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	"github.com/multica-ai/multica/server/internal/realtime"
-	"github.com/multica-ai/multica/server/internal/scheduler"
 	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/featureflag"
@@ -178,6 +179,12 @@ func backgroundServices(h *handler.Handler) (*service.TaskService, *service.Auto
 
 func main() {
 	logger.Init()
+	role, err := deployment.ParseProcessRole(os.Getenv("MULTICA_PROCESS_ROLE"))
+	if err != nil {
+		slog.Error("invalid process role", "error", err)
+		os.Exit(1)
+	}
+	slog.Info("process composition selected", "role", role)
 
 	// Warn about missing configuration
 	if os.Getenv("JWT_SECRET") == "" {
@@ -257,7 +264,9 @@ func main() {
 	var relayReadRedis *redis.Client
 	var shardedReadRedis *redis.Client
 	var legacyReadRedis *redis.Client
+	var prQueueRedis *redis.Client
 	var relay realtime.ManagedRelay
+	relayHealthy := func(context.Context) error { return fmt.Errorf("Redis relay is not configured") }
 	defer func() {
 		if relay != nil {
 			relay.Stop()
@@ -270,11 +279,16 @@ func main() {
 		closeRedisClient("realtime-read-sharded", shardedReadRedis)
 		closeRedisClient("realtime-read", relayReadRedis)
 		closeRedisClient("realtime-write", relayWriteRedis)
+		closeRedisClient("pr-refresh", prQueueRedis)
 		closeRedisClient("store", storeRedis)
 	}()
 	if redisURL := os.Getenv("REDIS_URL"); redisURL != "" {
 		opts, err := redis.ParseURL(redisURL)
 		if err != nil {
+			if role.Split() {
+				slog.Error("invalid REDIS_URL in split mode", "error", err)
+				os.Exit(1)
+			}
 			slog.Error("invalid REDIS_URL — falling back to in-memory hub", "error", err)
 		} else {
 			if envBool("REDIS_DISABLE_CLIENT_NAME", false) {
@@ -282,8 +296,48 @@ func main() {
 			}
 			storeRedis = newNamedRedisClient(opts, "store")
 			relayWriteRedis = newNamedRedisClient(opts, "realtime-write")
+			if role.Split() {
+				prQueueRedis = newNamedRedisClient(opts, "pr-refresh")
+			}
+			probe := func(probeCtx context.Context) error {
+				probeCtx, cancel := context.WithTimeout(probeCtx, 2*time.Second)
+				defer cancel()
+				if err := relayWriteRedis.Ping(probeCtx).Err(); err != nil {
+					return fmt.Errorf("Redis write probe: %w", err)
+				}
+				readClient := relayReadRedis
+				if shardedReadRedis != nil {
+					readClient = shardedReadRedis
+				}
+				if readClient == nil {
+					readClient = relayWriteRedis
+				}
+				probeKey := fmt.Sprintf("multica:release:relay-probe:%d", time.Now().UnixNano())
+				probeValue := strconv.FormatInt(time.Now().UnixNano(), 10)
+				if err := relayWriteRedis.Set(probeCtx, probeKey, probeValue, 10*time.Second).Err(); err != nil {
+					return fmt.Errorf("Redis round-trip write: %w", err)
+				}
+				defer relayWriteRedis.Del(context.Background(), probeKey)
+				got, err := readClient.Get(probeCtx, probeKey).Result()
+				if err != nil || got != probeValue {
+					return fmt.Errorf("Redis round-trip read: got %q: %w", got, err)
+				}
+				return nil
+			}
+			if err := probe(ctx); err != nil {
+				if role.Split() {
+					slog.Error("Redis startup probe failed in split mode", "error", err)
+					os.Exit(1)
+				}
+				slog.Warn("Redis startup probe failed; legacy all role will continue", "error", err)
+			}
+			relayHealthy = probe
 
 			relayMode := realtimeRelayModeFromEnv()
+			if role.Split() && relayMode == "legacy" {
+				slog.Error("legacy realtime relay mode is forbidden for split roles")
+				os.Exit(1)
+			}
 			relayConfig := shardedRelayConfigFromEnv()
 			switch relayMode {
 			case "legacy":
@@ -294,18 +348,46 @@ func main() {
 				shardedReadRedis = newNamedRedisClient(opts, "realtime-read-sharded")
 				legacyReadRedis = newNamedRedisClient(opts, "realtime-read-legacy")
 				sharded := realtime.NewShardedStreamRelay(hub, relayWriteRedis, shardedReadRedis, relayConfig)
-				sharded.SetDaemonRuntimeDeliverer(daemonHub)
+				if role.RunsWeb() {
+					sharded.SetDaemonRuntimeDeliverer(daemonHub)
+				}
 				legacy := realtime.NewRedisRelayWithClients(hub, relayWriteRedis, legacyReadRedis)
 				relay = realtime.NewMirroredRelay(sharded, legacy)
-				daemonWakeup = daemonws.NewRelayNotifier(daemonHub, sharded)
+				if role.RunsWeb() {
+					daemonWakeup = daemonws.NewRelayNotifier(daemonHub, sharded)
+				} else {
+					daemonWakeup = daemonws.NewRelayNotifier(nil, sharded)
+				}
 			default:
 				relayReadRedis = newNamedRedisClient(opts, "realtime-read")
 				sharded := realtime.NewShardedStreamRelay(hub, relayWriteRedis, relayReadRedis, relayConfig)
-				sharded.SetDaemonRuntimeDeliverer(daemonHub)
+				if role.RunsWeb() {
+					sharded.SetDaemonRuntimeDeliverer(daemonHub)
+				}
 				relay = sharded
-				daemonWakeup = daemonws.NewRelayNotifier(daemonHub, sharded)
+				if role.RunsWeb() {
+					daemonWakeup = daemonws.NewRelayNotifier(daemonHub, sharded)
+				} else {
+					daemonWakeup = daemonws.NewRelayNotifier(nil, sharded)
+				}
 			}
 			relay.Start(relayCtx)
+			baseRelayProbe := relayHealthy
+			relayHealthy = func(probeCtx context.Context) error {
+				if err := baseRelayProbe(probeCtx); err != nil {
+					return err
+				}
+				if !realtime.M.RedisConnected.Load() {
+					return fmt.Errorf("Redis relay consumer is not healthy")
+				}
+				return nil
+			}
+			if role.Split() {
+				if err := relayHealthy(ctx); err != nil {
+					slog.Error("Redis relay did not become ready in split mode", "error", err)
+					os.Exit(1)
+				}
+			}
 			broadcaster = realtime.NewDualWriteBroadcaster(hub, relay)
 			slog.Info(
 				"realtime: Redis relay enabled",
@@ -321,6 +403,10 @@ func main() {
 			)
 		}
 	} else {
+		if role.Split() {
+			slog.Error("REDIS_URL is required for web/worker split roles")
+			os.Exit(1)
+		}
 		slog.Info("realtime: REDIS_URL not set — using in-memory hub (single-node mode)")
 	}
 	registerListeners(bus, broadcaster)
@@ -390,10 +476,8 @@ func main() {
 		defer samplerPool.Close()
 	}
 
-	// Construct the BatchedHeartbeatScheduler before the router so it can
-	// be injected into the Handler. The Run goroutine starts below
-	// alongside the sweeper, and Stop is called explicitly during graceful
-	// shutdown so any pending bumps are flushed before we exit.
+	// Heartbeat batching belongs to the Web composition because heartbeat
+	// requests and their final flush must share one process lifecycle.
 	heartbeatScheduler := handler.NewBatchedHeartbeatScheduler(queries, handler.DefaultHeartbeatBatchInterval)
 
 	r, h := NewRouterWithOptions(pool, hub, bus, analyticsClient, storeRedis, RouterOptions{
@@ -405,15 +489,26 @@ func main() {
 		FeatureFlags:       flags,
 		HeartbeatScheduler: heartbeatScheduler,
 	})
-
-	srv := &http.Server{
-		Addr:    ":" + port,
-		Handler: r,
+	if role.Split() {
+		h.PRRefresh.ConfigureDistributedQueue(prQueueRedis, role == deployment.RoleWorker)
 	}
 
-	// Start background workers.
+	var apiHandler http.Handler = r
+	var controlStore *deployment.ControlStore
+	if role.Split() {
+		controlStore = deployment.NewControlStore(pool)
+	}
+	if role == deployment.RoleWeb {
+		gate := deployment.NewAdmissionGate(controlStore, relayHealthy)
+		apiHandler = deployment.RelayReadinessMiddleware(relayHealthy, gate.Middleware(apiHandler))
+	}
+
+	var srv *http.Server
+	if role.RunsWeb() {
+		srv = &http.Server{Addr: ":" + port, Handler: apiHandler}
+	}
+
 	sweepCtx, sweepCancel := context.WithCancel(context.Background())
-	autopilotCtx, autopilotCancel := context.WithCancel(context.Background())
 	// Reuse the router's services here. In particular, the router wires the
 	// EmptyClaim cache into TaskService; constructing a second TaskService for
 	// scheduled Autopilot dispatch would send the daemon wakeup without bumping
@@ -431,67 +526,51 @@ func main() {
 		liveness = handler.NewRedisLivenessStore(storeRedis)
 	}
 
-	// Start background sweeper to mark stale runtimes as offline.
-	go runRuntimeSweeper(sweepCtx, pool, queries, liveness, taskSvc, bus)
-	go heartbeatScheduler.Run(sweepCtx)
-	go runAutopilotFailureMonitor(autopilotCtx, queries, bus, envFailureMonitorConfig())
-	go runDBStatsLogger(sweepCtx, pool)
-	if h.WebhookDeliveryWorker != nil {
-		go h.WebhookDeliveryWorker.Run(sweepCtx)
+	workerRun := func(runCtx context.Context) error {
+		return runBackgroundComposition(runCtx, pool, queries, h, taskSvc, autopilotSvc, bus, liveness, channelMediaMetrics)
 	}
-	// GitHub PR-card API snapshot pipeline (MUL-5265): worker pool + TTL sweeper.
-	// No-op when unconfigured (no App private key).
-	h.PRRefresh.Start(sweepCtx)
-
-	// Channel inbound supervisor (MUL-3620): holds the §4.4 WS lease per
-	// installation and drives each channel.Channel. It is built
-	// unconditionally (it is channel-agnostic, not Lark-specific), so it
-	// always exists here; with no platform registered or no installation
-	// rows it simply idles. Lifecycle is bound to sweepCtx so it winds down
-	// alongside the other long-running workers, AFTER the HTTP server has
-	// drained.
-	if h.ChannelSupervisor != nil {
-		go h.ChannelSupervisor.Run(sweepCtx)
+	var adminServer *deployment.AdminServer
+	if role == deployment.RoleAll {
+		go func() {
+			if err := workerRun(sweepCtx); err != nil && err != context.Canceled {
+				slog.Warn("background composition stopped", "error", err)
+			}
+		}()
+	} else if role == deployment.RoleWorker {
+		generationRaw := strings.TrimSpace(os.Getenv("MULTICA_RELEASE_GENERATION"))
+		generation, parseErr := strconv.ParseInt(generationRaw, 10, 64)
+		owner := strings.TrimSpace(os.Getenv("MULTICA_WORKER_OWNER"))
+		if parseErr != nil || generation <= 0 || owner == "" {
+			slog.Error("worker split role requires positive MULTICA_RELEASE_GENERATION and non-empty MULTICA_WORKER_OWNER")
+			os.Exit(1)
+		}
+		controller := deployment.NewWorkerController(controlStore, generation, owner, relayHealthy)
+		adminAddr := strings.TrimSpace(os.Getenv("MULTICA_WORKER_ADMIN_ADDR"))
+		if adminAddr == "" {
+			adminAddr = "127.0.0.1:9091"
+		}
+		adminServer, err = deployment.NewAdminServer(
+			adminAddr, controlStore, controller, generation, owner,
+			strings.TrimSpace(os.Getenv("MULTICA_WORKER_ADMIN_TOKEN")),
+		)
+		if err != nil {
+			slog.Error("worker admin configuration failed", "error", err)
+			os.Exit(1)
+		}
+		go func() {
+			if err := adminServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				slog.Error("worker admin server stopped", "error", err)
+			}
+		}()
+		go func() {
+			if err := controller.Run(sweepCtx, workerRun); err != nil && err != context.Canceled {
+				slog.Warn("worker composition fenced or drained", "error", err, "status", controller.Status())
+			}
+		}()
 	}
-
-	// Media intent-ledger reconciler (PR #5580): settles uploaded-but-unbound
-	// channel media objects. An independent worker so object-storage latency
-	// spikes cannot starve any other sweeper's cadence.
-	if h.ChannelMediaReconciler != nil {
-		h.ChannelMediaReconciler.Metrics = channelMediaMetrics
-		go h.ChannelMediaReconciler.Run(sweepCtx)
+	if role.RunsWeb() {
+		go heartbeatScheduler.Run(sweepCtx)
 	}
-
-	// MUL-2957: DB-backed execution scheduler. The scheduler turns the
-	// `sys_cron_executions` table into the distributed lease + audit
-	// log for internal periodic jobs. The first job is
-	// `rollup_task_usage_hourly`, which replaces the previously
-	// operator-registered `pg_cron` entry (still safe to run
-	// concurrently — the SQL function holds advisory lock 4246).
-	//
-	// A failure to register the job is treated as fatal here only at
-	// the registration step (a duplicate name is the only realistic
-	// cause and indicates a code bug). Once running, the manager
-	// surfaces transient errors — DB unreachable, sys_cron_executions
-	// missing because of an unusual partial-migration state — by
-	// logging them on the tick that fails and retrying on the next
-	// cycle, so a temporary outage does not crash the server.
-	schedulerMgr := scheduler.NewManager(pool, scheduler.Options{})
-	if err := schedulerMgr.Register(scheduler.TaskUsageHourlyJob(pool)); err != nil {
-		slog.Warn("scheduler: failed to register task_usage_hourly rollup job", "error", err)
-	}
-	// MUL-3551: scheduled-Autopilot dispatch runs on the same DB-backed
-	// scheduler. The job owns its plan_times via PlansForScope (each
-	// trigger has its own cron expression, so the Cadence planner does
-	// not fit). Crash recovery, occurrence-level idempotency, lease
-	// theft, and retry are all reused from the manager + sys_cron_executions
-	// — there is no separate goroutine for scheduled Autopilot anymore.
-	if err := schedulerMgr.Register(scheduler.AutopilotScheduleDispatchJob(pool, queries, autopilotSvc)); err != nil {
-		slog.Warn("scheduler: failed to register autopilot_schedule_dispatch job", "error", err)
-	}
-	go func() {
-		_ = schedulerMgr.Run(sweepCtx)
-	}()
 
 	if metricsServer != nil {
 		go func() {
@@ -502,13 +581,15 @@ func main() {
 		}()
 	}
 
-	go func() {
-		slog.Info("server starting", "port", port)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			slog.Error("server error", "error", err)
-			os.Exit(1)
-		}
-	}()
+	if srv != nil {
+		go func() {
+			slog.Info("server starting", "port", port, "role", role)
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				slog.Error("server error", "error", err)
+				os.Exit(1)
+			}
+		}()
+	}
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -519,52 +600,64 @@ func main() {
 	signal.Stop(quit)
 
 	slog.Info("shutting down server")
-	autopilotCancel()
 
 	// Order matters: drain in-flight HTTP first so any heartbeat handlers
 	// finish calling Schedule() before we stop the scheduler. Otherwise a
 	// late heartbeat could enqueue a pending ID after Run has already
 	// drained and exited, and Stop() would not flush it.
-	apiShutdownCtx, apiShutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	if err := srv.Shutdown(apiShutdownCtx); err != nil {
+	if srv != nil {
+		apiShutdownCtx, apiShutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := srv.Shutdown(apiShutdownCtx); err != nil {
+			apiShutdownCancel()
+			slog.Error("server forced to shutdown", "error", err)
+			os.Exit(1)
+		}
 		apiShutdownCancel()
-		slog.Error("server forced to shutdown", "error", err)
-		os.Exit(1)
 	}
-	apiShutdownCancel()
 
 	// HTTP is fully drained — safe to stop the sweeper and flush the
 	// final batch of queued heartbeat bumps.
 	sweepCancel()
-	heartbeatScheduler.Stop()
-	if h.WebhookDeliveryWorker != nil && !h.WebhookDeliveryWorker.WaitWithTimeout(5*time.Second) {
-		slog.Warn("webhook delivery worker did not exit within shutdown timeout")
+	if role.RunsWeb() {
+		heartbeatScheduler.Stop()
 	}
-
-	// Join the channel supervisor's per-installation goroutines so the
-	// lease renewer can issue a final release before process exit;
-	// otherwise the next replica would have to wait the full LeaseTTL
-	// before picking up the installation on the other side of the
-	// redeploy. The wait is bounded — if a supervisor is wedged (DB
-	// pool stalled, a connector ignoring ctx, etc.) the fallback is the
-	// natural LeaseTTL expiry on the other side, which is strictly better
-	// than holding shutdown open forever. Then drain the Feishu runtime:
-	// the supervisors have stopped delivering inbound events, so flush the
-	// debounced run triggers and join any in-flight outbound replies
-	// (each bounded by ReplyTimeout) so a binding card / offline notice is
-	// not lost on shutdown.
-	if h.ChannelSupervisor != nil {
-		if !h.ChannelSupervisor.WaitWithTimeout(h.ChannelSupervisor.ShutdownTimeout()) {
-			slog.Warn("channel supervisor: connections did not exit within shutdown timeout; proceeding",
-				"timeout", h.ChannelSupervisor.ShutdownTimeout().String(),
-			)
+	if adminServer != nil {
+		adminShutdownCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		if err := adminServer.Shutdown(adminShutdownCtx); err != nil {
+			slog.Warn("worker admin shutdown failed", "error", err)
 		}
-		if h.ChannelRouter != nil {
-			drainCtx, drainCancel := context.WithTimeout(context.Background(), 10*time.Second)
-			if !h.ChannelRouter.Drain(drainCtx) {
-				slog.Warn("channel router: drain deadline reached; deferred media fallback remains durable")
+		cancel()
+	}
+	if role.RunsWorker() {
+		if h.WebhookDeliveryWorker != nil && !h.WebhookDeliveryWorker.WaitWithTimeout(5*time.Second) {
+			slog.Warn("webhook delivery worker did not exit within shutdown timeout")
+		}
+
+		// Join the channel supervisor's per-installation goroutines so the
+		// lease renewer can issue a final release before process exit;
+		// otherwise the next replica would have to wait the full LeaseTTL
+		// before picking up the installation on the other side of the
+		// redeploy. The wait is bounded — if a supervisor is wedged (DB
+		// pool stalled, a connector ignoring ctx, etc.) the fallback is the
+		// natural LeaseTTL expiry on the other side, which is strictly better
+		// than holding shutdown open forever. Then drain the Feishu runtime:
+		// the supervisors have stopped delivering inbound events, so flush the
+		// debounced run triggers and join any in-flight outbound replies
+		// (each bounded by ReplyTimeout) so a binding card / offline notice is
+		// not lost on shutdown.
+		if h.ChannelSupervisor != nil {
+			if !h.ChannelSupervisor.WaitWithTimeout(h.ChannelSupervisor.ShutdownTimeout()) {
+				slog.Warn("channel supervisor: connections did not exit within shutdown timeout; proceeding",
+					"timeout", h.ChannelSupervisor.ShutdownTimeout().String(),
+				)
 			}
-			drainCancel()
+			if h.ChannelRouter != nil {
+				drainCtx, drainCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				if !h.ChannelRouter.Drain(drainCtx) {
+					slog.Warn("channel router: drain deadline reached; deferred media fallback remains durable")
+				}
+				drainCancel()
+			}
 		}
 	}
 

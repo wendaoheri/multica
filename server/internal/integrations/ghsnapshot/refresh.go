@@ -2,6 +2,7 @@ package ghsnapshot
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"math/rand"
 	"sync"
@@ -10,7 +11,10 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
+	"github.com/redis/go-redis/v9"
 )
+
+const distributedRefreshQueueKey = "multica:ghsnapshot:refresh:v1"
 
 // TxBeginner is the subset of a pgx pool the manager needs to open the
 // snapshot-write transaction. *pgxpool.Pool satisfies it.
@@ -83,6 +87,9 @@ type Manager struct {
 
 	ctx     context.Context
 	started bool
+
+	distributedRedis   *redis.Client
+	consumeDistributed bool
 }
 
 // NewManager wires the pipeline. onApplied is called once per PR row whose
@@ -115,6 +122,17 @@ func NewManager(client *Client, queries *db.Queries, pool TxBeginner, onApplied 
 // Enabled reports whether the pipeline will actually do anything.
 func (m *Manager) Enabled() bool { return m != nil && m.client.Enabled() }
 
+// ConfigureDistributedQueue moves request-driven refresh hints out of the Web
+// process. Web publishes Redis-list hints; the active Worker consumes them into
+// its bounded local pool. PostgreSQL snapshots remain the fact source and the
+// TTL sweeper remains the recovery path if a hint expires or is evicted.
+func (m *Manager) ConfigureDistributedQueue(client *redis.Client, consume bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.distributedRedis = client
+	m.consumeDistributed = consume
+}
+
 // Start launches the worker pool and the TTL sweeper under ctx. No-op (and
 // safe) when the manager is disabled.
 func (m *Manager) Start(ctx context.Context) {
@@ -133,6 +151,9 @@ func (m *Manager) Start(ctx context.Context) {
 	for i := 0; i < m.concurrency; i++ {
 		go m.worker(ctx)
 	}
+	if m.distributedRedis != nil && m.consumeDistributed {
+		go m.distributedConsumer(ctx)
+	}
 	go m.sweepLoop(ctx)
 }
 
@@ -148,6 +169,27 @@ func (m *Manager) Enqueue(installationID int64, owner, repo string, number int32
 		return
 	}
 	addr := address{InstallationID: installationID, Owner: owner, Repo: repo, Number: number}
+	m.mu.Lock()
+	distributed := m.distributedRedis
+	consume := m.consumeDistributed
+	m.mu.Unlock()
+	if distributed != nil && !consume {
+		payload, err := json.Marshal(addr)
+		if err != nil {
+			slog.Warn("ghsnapshot: encode distributed refresh hint", "error", err)
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := distributed.RPush(ctx, distributedRefreshQueueKey, payload).Err(); err != nil {
+			slog.Warn("ghsnapshot: publish distributed refresh hint", "error", err)
+		}
+		return
+	}
+	m.enqueueLocal(addr)
+}
+
+func (m *Manager) enqueueLocal(addr address) {
 	m.mu.Lock()
 	if m.active[addr] {
 		if m.inFlight[addr] {
@@ -170,6 +212,30 @@ func (m *Manager) Enqueue(installationID int64, owner, repo string, number int32
 		delete(m.trailing, addr)
 		m.mu.Unlock()
 		slog.Warn("ghsnapshot: refresh queue full, dropping enqueue")
+	}
+}
+
+func (m *Manager) distributedConsumer(ctx context.Context) {
+	for {
+		result, err := m.distributedRedis.BLPop(ctx, time.Second, distributedRefreshQueueKey).Result()
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if err != redis.Nil {
+				slog.Warn("ghsnapshot: consume distributed refresh hint", "error", err)
+			}
+			continue
+		}
+		if len(result) != 2 {
+			continue
+		}
+		var addr address
+		if err := json.Unmarshal([]byte(result[1]), &addr); err != nil {
+			slog.Warn("ghsnapshot: decode distributed refresh hint", "error", err)
+			continue
+		}
+		m.enqueueLocal(addr)
 	}
 }
 

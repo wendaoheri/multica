@@ -100,7 +100,7 @@ type ComposioOverlayBuilder interface {
 }
 
 type TaskWakeupNotifier interface {
-	NotifyTaskAvailable(runtimeID, taskID string)
+	NotifyTaskAvailable(runtimeID, taskID string) error
 }
 
 // triggerSummaryMaxLen caps the snapshot length so the row stays cheap to
@@ -5168,7 +5168,13 @@ func (s *TaskService) notifyRuntimeMayHaveWork(runtimeID pgtype.UUID, taskID str
 	if s.Wakeup == nil {
 		return
 	}
-	s.Wakeup.NotifyTaskAvailable(runtimeKey, taskID)
+	if err := s.Wakeup.NotifyTaskAvailable(runtimeKey, taskID); err != nil {
+		slog.Warn("task wakeup failed after durable queue write",
+			"runtime_id", runtimeKey,
+			"task_id", taskID,
+			"error", err,
+		)
+	}
 }
 
 func (s *TaskService) broadcastTaskDispatch(ctx context.Context, task db.AgentTaskQueue) {

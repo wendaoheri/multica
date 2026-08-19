@@ -89,7 +89,9 @@ docker compose --profile migration -f "$COMPOSE_FILE" config --format json | jq 
   (($doc.services.migrator.command | join(" ")) as $command |
     ($command | index("begin-migrator-attempt")) < ($command | index("verify-manifest")) and
     ($command | index("verify-manifest")) < ($command | index("migrate up")) and
-    ($command | index("migrate up")) < ($command | index("record-migrator-execution"))) and
+    ($command | index("migrate up")) < ($command | index("record-migrator-execution")) and
+    ($command | contains("--attempt-id-file")) and
+    ($command | contains("--expected-attempt-id"))) and
   (["blue-web","green-web","blue-worker","green-worker","migrator"] | all(. as $name |
     ([$doc.services[$name].volumes[] | select(.source == $config and .target == "/run/multica-release/config.env" and .read_only == true)] | length == 1) and
     ([$doc.services[$name].volumes[] | select(.source == $flags and .target == "/run/multica-release/feature-flags.yaml" and .read_only == true)] | length == 1)))' >/dev/null
@@ -137,28 +139,48 @@ sed -i.bak '$d' "$config" && rm "$config.bak"
   --manifest "$work/artifacts/manifest.json" --artifact-dir "$work/artifacts" \
   --combination W1K1S1 --deployment-identity "$work/artifacts/deployment.actual.json" \
   --config-file "$config" --feature-flags-file "$flags" \
+  --attempt-id-file "$work/attempt-a.private" \
   --output "$work/execution/current-attempt.json" >/dev/null
-attempt_a=$(jq -er .attempt_id "$work/execution/current-attempt.json")
+attempt_a=$(tr -d '\n' <"$work/attempt-a.private")
 "$work/releasectl" record-migrator-execution \
   --manifest "$work/artifacts/manifest.json" --artifact-dir "$work/artifacts" \
   --combination W1K1S1 --deployment-identity "$work/artifacts/deployment.actual.json" \
   --config-file "$config" --feature-flags-file "$flags" \
   --current-attempt "$work/execution/current-attempt.json" \
+  --expected-attempt-id "$attempt_a" \
   --output "$work/execution/migrator-execution.json" >/dev/null
 "$work/releasectl" verify-migrator-execution \
   --manifest "$work/artifacts/manifest.json" --artifact-dir "$work/artifacts" \
   --combination W1K1S1 --current-attempt "$work/execution/current-attempt.json" \
   --execution-record "$work/execution/migrator-execution.json" >/dev/null
 
-# A retry begins by replacing current-attempt. Until the same nonce completes,
-# the older successful execution cannot authorize runtime smoke.
+# Simulate A having migrated, then B beginning before A completes. Completion
+# must use A's private nonce rather than re-reading and blessing shared B.
 "$work/releasectl" begin-migrator-attempt \
   --manifest "$work/artifacts/manifest.json" --artifact-dir "$work/artifacts" \
   --combination W1K1S1 --deployment-identity "$work/artifacts/deployment.actual.json" \
   --config-file "$config" --feature-flags-file "$flags" \
+  --attempt-id-file "$work/attempt-race-a.private" \
   --output "$work/execution/current-attempt.json" >/dev/null
-attempt_b=$(jq -er .attempt_id "$work/execution/current-attempt.json")
-[ "$attempt_a" != "$attempt_b" ]
+attempt_race_a=$(tr -d '\n' <"$work/attempt-race-a.private")
+"$work/releasectl" begin-migrator-attempt \
+  --manifest "$work/artifacts/manifest.json" --artifact-dir "$work/artifacts" \
+  --combination W1K1S1 --deployment-identity "$work/artifacts/deployment.actual.json" \
+  --config-file "$config" --feature-flags-file "$flags" \
+  --attempt-id-file "$work/attempt-b.private" \
+  --output "$work/execution/current-attempt.json" >/dev/null
+attempt_b=$(tr -d '\n' <"$work/attempt-b.private")
+[ "$attempt_race_a" != "$attempt_b" ]
+if "$work/releasectl" record-migrator-execution \
+  --manifest "$work/artifacts/manifest.json" --artifact-dir "$work/artifacts" \
+  --combination W1K1S1 --deployment-identity "$work/artifacts/deployment.actual.json" \
+  --config-file "$config" --feature-flags-file "$flags" \
+  --current-attempt "$work/execution/current-attempt.json" \
+  --expected-attempt-id "$attempt_race_a" \
+  --output "$work/execution/migrator-execution.json" >/dev/null 2>&1; then
+  echo "attempt A completion blessed later attempt B" >&2
+  exit 1
+fi
 if "$work/releasectl" verify-migrator-execution \
   --manifest "$work/artifacts/manifest.json" --artifact-dir "$work/artifacts" \
   --combination W1K1S1 --current-attempt "$work/execution/current-attempt.json" \
@@ -166,11 +188,32 @@ if "$work/releasectl" verify-migrator-execution \
   echo "old success authorized a new current attempt" >&2
   exit 1
 fi
+
+for expected in missing malformed wrong; do
+  expected_arg=""
+  case "$expected" in
+    missing) ;;
+    malformed) expected_arg="--expected-attempt-id not-a-nonce" ;;
+    wrong) expected_arg="--expected-attempt-id $(printf '%064d' 0)" ;;
+  esac
+  # shellcheck disable=SC2086 -- deliberately exercises a missing flag as well.
+  if "$work/releasectl" record-migrator-execution \
+    --manifest "$work/artifacts/manifest.json" --artifact-dir "$work/artifacts" \
+    --combination W1K1S1 --deployment-identity "$work/artifacts/deployment.actual.json" \
+    --config-file "$config" --feature-flags-file "$flags" \
+    --current-attempt "$work/execution/current-attempt.json" $expected_arg \
+    --output "$work/execution/migrator-execution.json" >/dev/null 2>&1; then
+    echo "$expected expected attempt id unexpectedly passed" >&2
+    exit 1
+  fi
+done
+
 if "$work/releasectl" record-migrator-execution \
   --manifest "$work/artifacts/manifest.json" --artifact-dir "$work/artifacts" \
   --combination W1K1S1 --deployment-identity "$work/artifacts/deployment.actual.json" \
   --config-file "$config" --feature-flags-file "$flags" \
   --current-attempt "$work/execution/current-attempt.json" \
+  --expected-attempt-id "$attempt_b" \
   --output "$work/missing/migrator-execution.json" >/dev/null 2>&1; then
   echo "completion record write failure was not propagated" >&2
   exit 1
@@ -187,6 +230,7 @@ fi
   --combination W1K1S1 --deployment-identity "$work/artifacts/deployment.actual.json" \
   --config-file "$config" --feature-flags-file "$flags" \
   --current-attempt "$work/execution/current-attempt.json" \
+  --expected-attempt-id "$attempt_b" \
   --output "$work/execution/migrator-execution.json" >/dev/null
 "$work/releasectl" verify-migrator-execution \
   --manifest "$work/artifacts/manifest.json" --artifact-dir "$work/artifacts" \

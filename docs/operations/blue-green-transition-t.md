@@ -73,10 +73,14 @@ config/flags mounts as release validation. Its fixed command order is:
 1. `begin-migrator-attempt` atomically replaces
    `RELEASE_EXECUTION_DIR/current-attempt.json` with a cryptographically random,
    non-reusable `attempt_id`, release/combination, complete deployment identity,
-   and RFC3339 `started_at`;
+   and RFC3339 `started_at`. The same command writes only the nonce to a `0600`
+   one-shot-private file created inside the migrator container; it does not
+   print the nonce;
 2. verify manifest/migrations and run `migrate up`;
-3. `record-migrator-execution` atomically writes the matching attempt id,
-   `started_at`, RFC3339 `completed_at`, and deployment identity.
+3. `record-migrator-execution --expected-attempt-id "$(cat "$attempt_file")"`
+   explicitly carries that invocation's private nonce and atomically writes
+   the matching attempt id, `started_at`, RFC3339 `completed_at`, and deployment
+   identity.
 
 Beginning the attempt is the first command. If it cannot persist, no verify or
 migration command runs. Once a retry begins, its new current attempt immediately
@@ -85,6 +89,14 @@ and deployment. A verify, migration, or completion-write failure therefore
 leaves the new attempt unmatched and smoke stays closed. Runtime smoke requires
 both files, exact nonce/binding equality, strict timestamps, and
 `completed_at >= started_at`; it uses no recency window or file mtime.
+
+Completion never derives its nonce from the shared current-attempt file. It
+validates the private expected nonce, rereads shared current, and writes a
+success record only when they match. If another one-shot replaces current
+before that check, completion fails. If replacement races after the check but
+before atomic success installation, the success remains bound to the earlier
+private nonce and runtime verification rejects current/success mismatch. The
+host release lock is defense in depth, not a correctness prerequisite.
 
 The durable files remain available after the one-shot container exits or is
 removed, so smoke never depends on default `compose ps -q` finding a cleaned
@@ -101,6 +113,8 @@ test -s "$MIGRATOR_EXECUTION_RECORD"
 host-mounted execution directory before Compose removes the container. Do not
 reorder the command chain, reuse an attempt id, or substitute an unprofiled
 `compose run`, a container label, a timestamp-age check, or file mtime.
+The private attempt file is created by `mktemp`, removed by an EXIT trap, and is
+never placed in the host-mounted execution directory or emitted to logs.
 
 ## Cutover
 

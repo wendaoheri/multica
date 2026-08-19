@@ -106,15 +106,20 @@ services:
       - ${RELEASE_CONFIG_FILE}:/run/multica-release/config.env:ro
       - ${RELEASE_FEATURE_FLAGS_FILE}:/run/multica-release/feature-flags.yaml:ro
     entrypoint: ["/bin/sh", "-ec"]
+    # The mktemp nonce is private to this one-shot; completion never infers it
+    # from the host-mounted shared current-attempt record.
     command:
       - >-
-        ./releasectl begin-migrator-attempt
+        attempt_file=$$(mktemp)
+        && trap 'rm -f "$$attempt_file"' EXIT
+        && ./releasectl begin-migrator-attempt
         --manifest /release/manifest.json
         --artifact-dir /release
         --combination ${TARGET_COMBINATION:?set TARGET_COMBINATION}
         --deployment-identity /release/deployment.actual.json
         --config-file /run/multica-release/config.env
         --feature-flags-file /run/multica-release/feature-flags.yaml
+        --attempt-id-file "$$attempt_file"
         --output /release-execution/current-attempt.json
         && ./releasectl verify-manifest
         --manifest /release/manifest.json
@@ -131,6 +136,7 @@ services:
         --config-file /run/multica-release/config.env
         --feature-flags-file /run/multica-release/feature-flags.yaml
         --current-attempt /release-execution/current-attempt.json
+        --expected-attempt-id "$$(cat "$$attempt_file")"
         --output /release-execution/migrator-execution.json
 
 volumes:

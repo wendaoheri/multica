@@ -42,11 +42,11 @@ type MigratorExecutionRecord struct {
 // BeginMigratorAttempt atomically replaces the current attempt before any
 // verification or migration command is allowed to run. A later failure leaves
 // this new nonce in place, so an older success record cannot authorize smoke.
-func BeginMigratorAttempt(manifest Manifest, artifactDir, combination, identityPath, configPath, flagsPath, output string, now time.Time) (MigratorAttempt, error) {
-	return beginMigratorAttempt(manifest, artifactDir, combination, identityPath, configPath, flagsPath, output, now, rand.Reader)
+func BeginMigratorAttempt(manifest Manifest, artifactDir, combination, identityPath, configPath, flagsPath, attemptIDPath, output string, now time.Time) (MigratorAttempt, error) {
+	return beginMigratorAttempt(manifest, artifactDir, combination, identityPath, configPath, flagsPath, attemptIDPath, output, now, rand.Reader)
 }
 
-func beginMigratorAttempt(manifest Manifest, artifactDir, combination, identityPath, configPath, flagsPath, output string, now time.Time, random io.Reader) (MigratorAttempt, error) {
+func beginMigratorAttempt(manifest Manifest, artifactDir, combination, identityPath, configPath, flagsPath, attemptIDPath, output string, now time.Time, random io.Reader) (MigratorAttempt, error) {
 	identity, err := verifyMigratorInputs(manifest, artifactDir, combination, identityPath, configPath, flagsPath)
 	if err != nil {
 		return MigratorAttempt{}, err
@@ -60,6 +60,11 @@ func beginMigratorAttempt(manifest Manifest, artifactDir, combination, identityP
 		ReleaseID: manifest.ReleaseID, Combination: combination,
 		StartedAt: now.UTC().Format(time.RFC3339Nano), Deployment: identity,
 	}
+	// The private file is local to this one-shot invocation. Completion must
+	// explicitly present this nonce; it must never infer it from shared current.
+	if err := writeFileAtomic(attemptIDPath, []byte(attempt.AttemptID+"\n"), ".migrator-attempt-id-*"); err != nil {
+		return MigratorAttempt{}, err
+	}
 	if err := writeJSONAtomic(output, attempt, ".migrator-attempt-*"); err != nil {
 		return MigratorAttempt{}, err
 	}
@@ -69,7 +74,14 @@ func beginMigratorAttempt(manifest Manifest, artifactDir, combination, identityP
 // RecordMigratorExecution completes exactly the current attempt. Callers invoke
 // it only after migrate up exits zero. If this write fails, the current attempt
 // remains unmatched and runtime identity stays fail closed.
-func RecordMigratorExecution(manifest Manifest, artifactDir, combination, identityPath, configPath, flagsPath, currentAttemptPath, output string, now time.Time) error {
+func RecordMigratorExecution(manifest Manifest, artifactDir, combination, identityPath, configPath, flagsPath, currentAttemptPath, expectedAttemptID, output string, now time.Time) error {
+	return recordMigratorExecution(manifest, artifactDir, combination, identityPath, configPath, flagsPath, currentAttemptPath, expectedAttemptID, output, now, nil)
+}
+
+func recordMigratorExecution(manifest Manifest, artifactDir, combination, identityPath, configPath, flagsPath, currentAttemptPath, expectedAttemptID, output string, now time.Time, beforeInstall func()) error {
+	if !attemptIDPattern.MatchString(expectedAttemptID) {
+		return fmt.Errorf("expected migrator attempt id is invalid")
+	}
 	identity, err := verifyMigratorInputs(manifest, artifactDir, combination, identityPath, configPath, flagsPath)
 	if err != nil {
 		return err
@@ -77,6 +89,9 @@ func RecordMigratorExecution(manifest Manifest, artifactDir, combination, identi
 	attempt, err := loadMigratorAttempt(currentAttemptPath)
 	if err != nil {
 		return err
+	}
+	if attempt.AttemptID != expectedAttemptID {
+		return fmt.Errorf("current migrator attempt does not match expected attempt id")
 	}
 	started, err := validateAttempt(manifest, combination, attempt)
 	if err != nil {
@@ -91,9 +106,12 @@ func RecordMigratorExecution(manifest Manifest, artifactDir, combination, identi
 	}
 	record := MigratorExecutionRecord{
 		Version: MigratorExecutionRecordVersion, Result: "PASS",
-		AttemptID: attempt.AttemptID, ReleaseID: attempt.ReleaseID,
+		AttemptID: expectedAttemptID, ReleaseID: attempt.ReleaseID,
 		Combination: attempt.Combination, StartedAt: attempt.StartedAt,
 		CompletedAt: completed.Format(time.RFC3339Nano), Deployment: attempt.Deployment,
+	}
+	if beforeInstall != nil {
+		beforeInstall()
 	}
 	return writeJSONAtomic(output, record, ".migrator-execution-*")
 }
@@ -207,6 +225,10 @@ func writeJSONAtomic(path string, value any, pattern string) error {
 	if err != nil {
 		return err
 	}
+	return writeFileAtomic(path, append(b, '\n'), pattern)
+}
+
+func writeFileAtomic(path string, contents []byte, pattern string) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, pattern)
 	if err != nil {
@@ -218,7 +240,7 @@ func writeJSONAtomic(path string, value any, pattern string) error {
 		tmp.Close()
 		return err
 	}
-	if _, err := tmp.Write(append(b, '\n')); err != nil {
+	if _, err := tmp.Write(contents); err != nil {
 		tmp.Close()
 		return err
 	}

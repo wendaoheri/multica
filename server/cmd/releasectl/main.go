@@ -145,9 +145,10 @@ func recordMigratorExecution(args []string) {
 	config := fs.String("config-file", "", "actual effective config")
 	flags := fs.String("feature-flags-file", "", "actual effective flags")
 	currentAttempt := fs.String("current-attempt", "", "durable current migrator attempt")
+	expectedAttemptID := fs.String("expected-attempt-id", "", "private attempt id returned by this one-shot begin")
 	output := fs.String("output", "", "durable one-shot execution record")
 	_ = fs.Parse(args)
-	if *manifestPath == "" || *combination == "" || *identity == "" || *config == "" || *flags == "" || *currentAttempt == "" || *output == "" {
+	if *manifestPath == "" || *combination == "" || *identity == "" || *config == "" || *flags == "" || *currentAttempt == "" || *expectedAttemptID == "" || *output == "" {
 		fatal(errors.New("all record-migrator-execution flags are required"))
 	}
 	if *artifactDir == "" {
@@ -157,7 +158,7 @@ func recordMigratorExecution(args []string) {
 	if err != nil {
 		fatal(err)
 	}
-	if err := releasecompat.RecordMigratorExecution(manifest, *artifactDir, *combination, *identity, *config, *flags, *currentAttempt, *output, time.Now()); err != nil {
+	if err := releasecompat.RecordMigratorExecution(manifest, *artifactDir, *combination, *identity, *config, *flags, *currentAttempt, *expectedAttemptID, *output, time.Now()); err != nil {
 		fatal(err)
 	}
 	printJSON(map[string]any{"status": "recorded", "release_id": manifest.ReleaseID, "combination": *combination})
@@ -171,9 +172,10 @@ func beginMigratorAttempt(args []string) {
 	identity := fs.String("deployment-identity", "", "verified deployment identity JSON")
 	config := fs.String("config-file", "", "actual effective config")
 	flags := fs.String("feature-flags-file", "", "actual effective flags")
+	attemptIDFile := fs.String("attempt-id-file", "", "private file receiving this one-shot attempt id")
 	output := fs.String("output", "", "durable current migrator attempt")
 	_ = fs.Parse(args)
-	if *manifestPath == "" || *combination == "" || *identity == "" || *config == "" || *flags == "" || *output == "" {
+	if *manifestPath == "" || *combination == "" || *identity == "" || *config == "" || *flags == "" || *attemptIDFile == "" || *output == "" {
 		fatal(errors.New("all begin-migrator-attempt flags are required"))
 	}
 	if *artifactDir == "" {
@@ -183,11 +185,11 @@ func beginMigratorAttempt(args []string) {
 	if err != nil {
 		fatal(err)
 	}
-	attempt, err := releasecompat.BeginMigratorAttempt(manifest, *artifactDir, *combination, *identity, *config, *flags, *output, time.Now())
+	_, err = releasecompat.BeginMigratorAttempt(manifest, *artifactDir, *combination, *identity, *config, *flags, *attemptIDFile, *output, time.Now())
 	if err != nil {
 		fatal(err)
 	}
-	printJSON(map[string]any{"status": "started", "release_id": manifest.ReleaseID, "combination": *combination, "attempt_id": attempt.AttemptID})
+	printJSON(map[string]any{"status": "started", "release_id": manifest.ReleaseID, "combination": *combination})
 }
 
 func verifyMigratorExecution(args []string) {

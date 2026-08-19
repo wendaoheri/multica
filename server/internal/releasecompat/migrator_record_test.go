@@ -11,9 +11,9 @@ import (
 )
 
 type migratorFixture struct {
-	dir, config, flags, identity, current, execution string
-	manifest                                         Manifest
-	deployment                                       DeploymentIdentity
+	dir, config, flags, identity, private, current, execution string
+	manifest                                                  Manifest
+	deployment                                                DeploymentIdentity
 }
 
 func newMigratorFixture(t *testing.T) migratorFixture {
@@ -21,7 +21,7 @@ func newMigratorFixture(t *testing.T) migratorFixture {
 	dir := t.TempDir()
 	f := migratorFixture{
 		dir: dir, config: filepath.Join(dir, "config.env"), flags: filepath.Join(dir, "flags.yaml"),
-		identity: filepath.Join(dir, "deployment.actual.json"), current: filepath.Join(dir, "current-attempt.json"),
+		identity: filepath.Join(dir, "deployment.actual.json"), private: filepath.Join(dir, "private-attempt-id"), current: filepath.Join(dir, "current-attempt.json"),
 		execution: filepath.Join(dir, "migrator-execution.json"), manifest: validManifest(),
 	}
 	mustWrite(t, f.config, "DATABASE_URL=postgres://fixture\n")
@@ -43,16 +43,16 @@ func newMigratorFixture(t *testing.T) migratorFixture {
 
 func (f migratorFixture) begin(t *testing.T, now time.Time, fill byte) MigratorAttempt {
 	t.Helper()
-	attempt, err := beginMigratorAttempt(f.manifest, f.dir, "W1K1S1", f.identity, f.config, f.flags, f.current, now, bytes.NewReader(bytes.Repeat([]byte{fill}, 32)))
+	attempt, err := beginMigratorAttempt(f.manifest, f.dir, "W1K1S1", f.identity, f.config, f.flags, f.private, f.current, now, bytes.NewReader(bytes.Repeat([]byte{fill}, 32)))
 	if err != nil {
 		t.Fatalf("BeginMigratorAttempt: %v", err)
 	}
 	return attempt
 }
 
-func (f migratorFixture) complete(t *testing.T, now time.Time) {
+func (f migratorFixture) complete(t *testing.T, expectedAttemptID string, now time.Time) {
 	t.Helper()
-	if err := RecordMigratorExecution(f.manifest, f.dir, "W1K1S1", f.identity, f.config, f.flags, f.current, f.execution, now); err != nil {
+	if err := RecordMigratorExecution(f.manifest, f.dir, "W1K1S1", f.identity, f.config, f.flags, f.current, expectedAttemptID, f.execution, now); err != nil {
 		t.Fatalf("RecordMigratorExecution: %v", err)
 	}
 }
@@ -61,7 +61,7 @@ func TestMigratorAttemptInvalidatesOlderSuccessBeforeMigration(t *testing.T) {
 	f := newMigratorFixture(t)
 	startA := time.Date(2026, 8, 19, 4, 0, 0, 0, time.UTC)
 	attemptA := f.begin(t, startA, 'a')
-	f.complete(t, startA.Add(time.Minute))
+	f.complete(t, attemptA.AttemptID, startA.Add(time.Minute))
 	if _, err := VerifyMigratorExecution(f.manifest, f.dir, "W1K1S1", f.current, f.execution); err != nil {
 		t.Fatalf("attempt A should verify: %v", err)
 	}
@@ -80,12 +80,12 @@ func TestMigratorAttemptInvalidatesOlderSuccessBeforeMigration(t *testing.T) {
 func TestMigratorCompletionWriteFailureKeepsNewAttemptFailClosed(t *testing.T) {
 	f := newMigratorFixture(t)
 	start := time.Date(2026, 8, 19, 4, 0, 0, 0, time.UTC)
-	f.begin(t, start, 'a')
-	f.complete(t, start.Add(time.Minute))
-	f.begin(t, start.Add(2*time.Minute), 'b')
+	attemptA := f.begin(t, start, 'a')
+	f.complete(t, attemptA.AttemptID, start.Add(time.Minute))
+	attemptB := f.begin(t, start.Add(2*time.Minute), 'b')
 
 	badOutput := filepath.Join(f.dir, "missing", "migrator-execution.json")
-	if err := RecordMigratorExecution(f.manifest, f.dir, "W1K1S1", f.identity, f.config, f.flags, f.current, badOutput, start.Add(3*time.Minute)); err == nil {
+	if err := RecordMigratorExecution(f.manifest, f.dir, "W1K1S1", f.identity, f.config, f.flags, f.current, attemptB.AttemptID, badOutput, start.Add(3*time.Minute)); err == nil {
 		t.Fatal("completion record write unexpectedly succeeded")
 	}
 	if _, err := VerifyMigratorExecution(f.manifest, f.dir, "W1K1S1", f.current, f.execution); err == nil {
@@ -100,8 +100,8 @@ func TestMigratorCompletionWriteFailureKeepsNewAttemptFailClosed(t *testing.T) {
 func TestVerifyMigratorExecutionRejectsNonceAndTimestampForgery(t *testing.T) {
 	f := newMigratorFixture(t)
 	start := time.Date(2026, 8, 19, 4, 0, 0, 0, time.UTC)
-	f.begin(t, start, 'b')
-	f.complete(t, start.Add(time.Minute))
+	attempt := f.begin(t, start, 'b')
+	f.complete(t, attempt.AttemptID, start.Add(time.Minute))
 	original, err := os.ReadFile(f.execution)
 	if err != nil {
 		t.Fatal(err)
@@ -157,7 +157,7 @@ func TestMigratorAttemptSuccessSurvivesOneShotCleanup(t *testing.T) {
 	f := newMigratorFixture(t)
 	start := time.Date(2026, 8, 19, 4, 0, 0, 123, time.UTC)
 	attempt := f.begin(t, start, 'b')
-	f.complete(t, start.Add(time.Minute))
+	f.complete(t, attempt.AttemptID, start.Add(time.Minute))
 	if err := os.Remove(f.identity); err != nil {
 		t.Fatal(err)
 	}
@@ -170,12 +170,84 @@ func TestMigratorAttemptSuccessSurvivesOneShotCleanup(t *testing.T) {
 	}
 }
 
+func TestMigratorCompletionRequiresExpectedPrivateAttemptID(t *testing.T) {
+	f := newMigratorFixture(t)
+	start := time.Date(2026, 8, 19, 5, 0, 0, 0, time.UTC)
+	attempt := f.begin(t, start, 'a')
+
+	privateID, err := os.ReadFile(f.private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(privateID)) != attempt.AttemptID {
+		t.Fatal("private attempt id does not match durable current attempt")
+	}
+	info, err := os.Stat(f.private)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("private attempt id mode = %o, want 600", info.Mode().Perm())
+	}
+
+	for _, expected := range []string{"", "not-a-nonce", strings.Repeat("b", 64)} {
+		if err := RecordMigratorExecution(f.manifest, f.dir, "W1K1S1", f.identity, f.config, f.flags, f.current, expected, f.execution, start.Add(time.Minute)); err == nil {
+			t.Fatalf("completion accepted expected attempt id %q", expected)
+		}
+	}
+	if _, err := os.Stat(f.execution); !os.IsNotExist(err) {
+		t.Fatalf("invalid completion installed a success record: %v", err)
+	}
+}
+
+func TestMigratorCompletionRejectsCurrentOverwrittenBeforeValidation(t *testing.T) {
+	f := newMigratorFixture(t)
+	start := time.Date(2026, 8, 19, 5, 0, 0, 0, time.UTC)
+	attemptA := f.begin(t, start, 'a')
+	attemptB := f.begin(t, start.Add(time.Minute), 'b')
+
+	if err := RecordMigratorExecution(f.manifest, f.dir, "W1K1S1", f.identity, f.config, f.flags, f.current, attemptA.AttemptID, f.execution, start.Add(2*time.Minute)); err == nil {
+		t.Fatal("attempt A completed after current was replaced by attempt B")
+	}
+	if _, err := VerifyMigratorExecution(f.manifest, f.dir, "W1K1S1", f.current, f.execution); err == nil {
+		t.Fatalf("unmigrated attempt B %s was authorized", attemptB.AttemptID)
+	}
+}
+
+func TestMigratorVerifierRejectsCurrentOverwrittenAfterCompletionValidation(t *testing.T) {
+	f := newMigratorFixture(t)
+	start := time.Date(2026, 8, 19, 5, 0, 0, 0, time.UTC)
+	attemptA := f.begin(t, start, 'a')
+	var attemptB MigratorAttempt
+	err := recordMigratorExecution(
+		f.manifest, f.dir, "W1K1S1", f.identity, f.config, f.flags,
+		f.current, attemptA.AttemptID, f.execution, start.Add(2*time.Minute),
+		func() { attemptB = f.begin(t, start.Add(time.Minute), 'b') },
+	)
+	if err != nil {
+		t.Fatalf("simulated attempt A completion install: %v", err)
+	}
+	var record MigratorExecutionRecord
+	if err := loadStrictJSON(f.execution, &record); err != nil {
+		t.Fatal(err)
+	}
+	if record.AttemptID != attemptA.AttemptID {
+		t.Fatalf("completion rebound A to later attempt B: got %s want %s", record.AttemptID, attemptA.AttemptID)
+	}
+	if record.AttemptID == attemptB.AttemptID {
+		t.Fatal("completion record used the later shared current nonce")
+	}
+	if _, err := VerifyMigratorExecution(f.manifest, f.dir, "W1K1S1", f.current, f.execution); err == nil || !strings.Contains(err.Error(), "attempt id mismatch") {
+		t.Fatalf("attempt A success authorized current attempt B: %v", err)
+	}
+}
+
 func TestBeginMigratorAttemptRejectsActualInputDriftWithoutReplacingCurrent(t *testing.T) {
 	f := newMigratorFixture(t)
 	start := time.Date(2026, 8, 19, 4, 0, 0, 0, time.UTC)
 	attempt := f.begin(t, start, 'a')
 	mustWrite(t, f.config, "DATABASE_URL=postgres://drift\n")
-	if _, err := BeginMigratorAttempt(f.manifest, f.dir, "W1K1S1", f.identity, f.config, f.flags, f.current, start.Add(time.Minute)); err == nil {
+	if _, err := BeginMigratorAttempt(f.manifest, f.dir, "W1K1S1", f.identity, f.config, f.flags, f.private, f.current, start.Add(time.Minute)); err == nil {
 		t.Fatal("config drift accepted")
 	}
 	current, err := loadMigratorAttempt(f.current)

@@ -115,6 +115,10 @@ reorder the command chain, reuse an attempt id, or substitute an unprofiled
 `compose run`, a container label, a timestamp-age check, or file mtime.
 The private attempt file is created by `mktemp`, removed by an EXIT trap, and is
 never placed in the host-mounted execution directory or emitted to logs.
+The begin, completion, and verification CLI responses omit the attempt nonce
+and actual config/flags values on both success and failure. Verification returns
+only its non-sensitive status/binding fields and deployment identity; durable
+current/success files retain the nonce solely for machine verification.
 
 ## Cutover
 

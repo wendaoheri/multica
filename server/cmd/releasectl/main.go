@@ -214,7 +214,7 @@ func verifyMigratorExecution(args []string) {
 	if err != nil {
 		fatal(err)
 	}
-	printJSON(map[string]any{"status": "verified", "release_id": manifest.ReleaseID, "combination": *combination, "attempt_id": record.AttemptID, "deployment": record.Deployment})
+	printJSON(map[string]any{"status": "verified", "release_id": manifest.ReleaseID, "combination": *combination, "deployment": record.Deployment})
 }
 
 func verifyDeployment(args []string) {

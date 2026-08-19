@@ -6,6 +6,22 @@ work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 mkdir "$work/artifacts" "$work/bin" "$work/execution" "$work/migrations"
 
+config_sentinel=compose-fixture-secret-do-not-log
+flags_sentinel=flags-fixture-secret-do-not-log
+assert_cli_output_clean() {
+  label=$1
+  stdout_file=$2
+  stderr_file=$3
+  shift 3
+  for forbidden in "$config_sentinel" "$flags_sentinel" \
+    --expected-attempt-id --config-file --feature-flags-file "$@"; do
+    if [ -n "$forbidden" ] && grep -F -- "$forbidden" "$stdout_file" "$stderr_file" >/dev/null; then
+      echo "$label leaked protected CLI input" >&2
+      exit 1
+    fi
+  done
+}
+
 command -v docker >/dev/null
 docker compose version >/dev/null
 (cd "$root/server" && go build -o "$work/releasectl" ./cmd/releasectl)
@@ -26,7 +42,7 @@ REALTIME_RELAY_MODE=sharded
 REALTIME_RELAY_MAX_CONSUMER_LAG=30s
 TEST_SECRET=compose-fixture-secret-do-not-log
 EOF
-printf 'transition_t: true\n' >"$flags"
+printf 'transition_t: true\nfixture_marker: flags-fixture-secret-do-not-log\n' >"$flags"
 config_sum=$("$work/releasectl" checksum --file "$config")
 flags_sum=$("$work/releasectl" checksum --file "$flags")
 rollback_sum=$("$work/releasectl" checksum --file "$root/deploy/bluegreen/release.sh")
@@ -140,19 +156,28 @@ sed -i.bak '$d' "$config" && rm "$config.bak"
   --combination W1K1S1 --deployment-identity "$work/artifacts/deployment.actual.json" \
   --config-file "$config" --feature-flags-file "$flags" \
   --attempt-id-file "$work/attempt-a.private" \
-  --output "$work/execution/current-attempt.json" >/dev/null
+  --output "$work/execution/current-attempt.json" \
+  >"$work/begin.stdout" 2>"$work/begin.stderr"
 attempt_a=$(tr -d '\n' <"$work/attempt-a.private")
+assert_cli_output_clean begin "$work/begin.stdout" "$work/begin.stderr" "$attempt_a"
 "$work/releasectl" record-migrator-execution \
   --manifest "$work/artifacts/manifest.json" --artifact-dir "$work/artifacts" \
   --combination W1K1S1 --deployment-identity "$work/artifacts/deployment.actual.json" \
   --config-file "$config" --feature-flags-file "$flags" \
   --current-attempt "$work/execution/current-attempt.json" \
   --expected-attempt-id "$attempt_a" \
-  --output "$work/execution/migrator-execution.json" >/dev/null
+  --output "$work/execution/migrator-execution.json" \
+  >"$work/record.stdout" 2>"$work/record.stderr"
+assert_cli_output_clean record "$work/record.stdout" "$work/record.stderr" "$attempt_a"
 "$work/releasectl" verify-migrator-execution \
   --manifest "$work/artifacts/manifest.json" --artifact-dir "$work/artifacts" \
   --combination W1K1S1 --current-attempt "$work/execution/current-attempt.json" \
-  --execution-record "$work/execution/migrator-execution.json" >/dev/null
+  --execution-record "$work/execution/migrator-execution.json" \
+  >"$work/verify.stdout" 2>"$work/verify.stderr"
+assert_cli_output_clean verify "$work/verify.stdout" "$work/verify.stderr" "$attempt_a"
+jq -e '(.attempt_id | not) and .status == "verified" and
+  (.deployment.migrator_image | test("@sha256:[0-9a-f]{64}$"))' \
+  "$work/verify.stdout" >/dev/null
 
 # Simulate A having migrated, then B beginning before A completes. Completion
 # must use A's private nonce rather than re-reading and blessing shared B.
@@ -177,24 +202,31 @@ if "$work/releasectl" record-migrator-execution \
   --config-file "$config" --feature-flags-file "$flags" \
   --current-attempt "$work/execution/current-attempt.json" \
   --expected-attempt-id "$attempt_race_a" \
-  --output "$work/execution/migrator-execution.json" >/dev/null 2>&1; then
+  --output "$work/execution/migrator-execution.json" \
+  >"$work/race-complete.stdout" 2>"$work/race-complete.stderr"; then
   echo "attempt A completion blessed later attempt B" >&2
   exit 1
 fi
+assert_cli_output_clean race-complete "$work/race-complete.stdout" "$work/race-complete.stderr" \
+  "$attempt_a" "$attempt_race_a" "$attempt_b"
 if "$work/releasectl" verify-migrator-execution \
   --manifest "$work/artifacts/manifest.json" --artifact-dir "$work/artifacts" \
   --combination W1K1S1 --current-attempt "$work/execution/current-attempt.json" \
-  --execution-record "$work/execution/migrator-execution.json" >/dev/null 2>&1; then
+  --execution-record "$work/execution/migrator-execution.json" \
+  >"$work/stale-verify.stdout" 2>"$work/stale-verify.stderr"; then
   echo "old success authorized a new current attempt" >&2
   exit 1
 fi
+assert_cli_output_clean stale-verify "$work/stale-verify.stdout" "$work/stale-verify.stderr" \
+  "$attempt_a" "$attempt_race_a" "$attempt_b"
 
 for expected in missing malformed wrong; do
   expected_arg=""
+  expected_value=""
   case "$expected" in
     missing) ;;
-    malformed) expected_arg="--expected-attempt-id not-a-nonce" ;;
-    wrong) expected_arg="--expected-attempt-id $(printf '%064d' 0)" ;;
+    malformed) expected_value=not-a-nonce; expected_arg="--expected-attempt-id $expected_value" ;;
+    wrong) expected_value=$(printf '%064d' 0); expected_arg="--expected-attempt-id $expected_value" ;;
   esac
   # shellcheck disable=SC2086 -- deliberately exercises a missing flag as well.
   if "$work/releasectl" record-migrator-execution \
@@ -202,10 +234,13 @@ for expected in missing malformed wrong; do
     --combination W1K1S1 --deployment-identity "$work/artifacts/deployment.actual.json" \
     --config-file "$config" --feature-flags-file "$flags" \
     --current-attempt "$work/execution/current-attempt.json" $expected_arg \
-    --output "$work/execution/migrator-execution.json" >/dev/null 2>&1; then
+    --output "$work/execution/migrator-execution.json" \
+    >"$work/expected-$expected.stdout" 2>"$work/expected-$expected.stderr"; then
     echo "$expected expected attempt id unexpectedly passed" >&2
     exit 1
   fi
+  assert_cli_output_clean "expected-$expected" "$work/expected-$expected.stdout" \
+    "$work/expected-$expected.stderr" "$attempt_a" "$attempt_race_a" "$attempt_b" "$expected_value"
 done
 
 if "$work/releasectl" record-migrator-execution \
@@ -214,17 +249,23 @@ if "$work/releasectl" record-migrator-execution \
   --config-file "$config" --feature-flags-file "$flags" \
   --current-attempt "$work/execution/current-attempt.json" \
   --expected-attempt-id "$attempt_b" \
-  --output "$work/missing/migrator-execution.json" >/dev/null 2>&1; then
+  --output "$work/missing/migrator-execution.json" \
+  >"$work/write-failure.stdout" 2>"$work/write-failure.stderr"; then
   echo "completion record write failure was not propagated" >&2
   exit 1
 fi
+assert_cli_output_clean write-failure "$work/write-failure.stdout" "$work/write-failure.stderr" \
+  "$attempt_a" "$attempt_race_a" "$attempt_b"
 if "$work/releasectl" verify-migrator-execution \
   --manifest "$work/artifacts/manifest.json" --artifact-dir "$work/artifacts" \
   --combination W1K1S1 --current-attempt "$work/execution/current-attempt.json" \
-  --execution-record "$work/execution/migrator-execution.json" >/dev/null 2>&1; then
+  --execution-record "$work/execution/migrator-execution.json" \
+  >"$work/incomplete-verify.stdout" 2>"$work/incomplete-verify.stderr"; then
   echo "old success authorized after completion write failure" >&2
   exit 1
 fi
+assert_cli_output_clean incomplete-verify "$work/incomplete-verify.stdout" \
+  "$work/incomplete-verify.stderr" "$attempt_a" "$attempt_race_a" "$attempt_b"
 "$work/releasectl" record-migrator-execution \
   --manifest "$work/artifacts/manifest.json" --artifact-dir "$work/artifacts" \
   --combination W1K1S1 --deployment-identity "$work/artifacts/deployment.actual.json" \
@@ -237,4 +278,4 @@ fi
   --combination W1K1S1 --current-attempt "$work/execution/current-attempt.json" \
   --execution-record "$work/execution/migrator-execution.json" >/dev/null
 
-echo "real Compose identity plus non-reusable begin/complete one-shot attempt lifecycle: PASS"
+echo "real Compose identity, one-shot attempt lifecycle, and CLI output redaction: PASS"

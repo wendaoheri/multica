@@ -56,7 +56,8 @@ for arg in "$@"; do url=$arg; done
 printf 'curl %s\n' "$url" >>"$ACTION_LOG"
 case "$url" in
   */status) printf '%s\n' '{"control":{"claims_enabled":false,"admission_open":false,"drain_requested":true,"worker_in_flight":0,"worker_leases":0,"drain_zero_since":"2026-08-19T00:00:00Z"},"worker":{"accepting_new":false}}' ;;
-  *green*/activate) [ "${FAIL_GREEN_ACTIVATE:-0}" = 1 ] && exit 22 ;;
+  */admission/close) if [ "${FAIL_CLOSE:-0}" = 1 ] && [ -f "$ACTION_LOG.activation-failed" ]; then exit 22; fi ;;
+  *green*/activate) if [ "${FAIL_GREEN_ACTIVATE:-0}" = 1 ]; then : >"$ACTION_LOG.activation-failed"; exit 22; fi ;;
   *) printf '%s\n' '{}' ;;
 esac
 EOF
@@ -100,6 +101,7 @@ unset FAIL_CANDIDATE
 
 : >"$log"
 FAIL_GREEN_ACTIVATE=1; export FAIL_GREEN_ACTIVATE
+FAIL_CLOSE=1; export FAIL_CLOSE
 set +e
 run_release cutover-green --execute >"$work/out" 2>&1
 code=$?
@@ -107,6 +109,8 @@ set -e
 test "$code" -ne 0
 ! grep -q 'green/admission/open\|green/enable-claims' "$log"
 unset FAIL_GREEN_ACTIVATE
+unset FAIL_CLOSE
+rm -f "$log.activation-failed"
 
 : >"$log"
 printf 'BLUE\n' >"$live"

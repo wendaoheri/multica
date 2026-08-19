@@ -183,7 +183,10 @@ rollback_candidate() {
 }
 
 observe_or_rollback() {
-  : "${OBSERVATION_COMMAND:?set OBSERVATION_COMMAND to the window collector}"
+  if [ -z "${OBSERVATION_COMMAND:-}" ]; then
+    echo "set OBSERVATION_COMMAND to the window collector" >&2
+    return 1
+  fi
   : "${OBSERVATION_DURATION_SECONDS:=3600}"
   : "${OBSERVATION_INTERVAL_SECONDS:=60}"
   case "$OBSERVATION_DURATION_SECONDS:$OBSERVATION_INTERVAL_SECONDS" in *[!0-9:]*|0:*|*:0) echo "observation durations must be positive integers" >&2; return 1 ;; esac

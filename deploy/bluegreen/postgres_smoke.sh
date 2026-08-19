@@ -36,6 +36,11 @@ grep -q 'REDIS_URL is required for web/worker split roles' "$work/no-redis.log"
 
 "$work/releasectl" status | jq -e \
   '.active_generation == 1 and .claims_enabled == false and .admission_open == false' >/dev/null
+if "$work/releasectl" activate --generation 2 --owner worker-a >/dev/null 2>&1; then
+  echo "wrong-generation activation unexpectedly succeeded" >&2
+  exit 1
+fi
+"$work/releasectl" status | jq -e '.claims_enabled == false and .admission_open == false and .worker_owner == null' >/dev/null
 "$work/releasectl" activate --generation 1 --owner worker-a >/dev/null
 "$work/releasectl" status | jq -e '.claims_enabled == true and .admission_open == true and .worker_owner == "worker-a"' >/dev/null
 if "$work/releasectl" activate --generation 1 --owner worker-b >/dev/null 2>&1; then

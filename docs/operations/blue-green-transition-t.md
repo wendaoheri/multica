@@ -23,8 +23,14 @@ independent reviewer approves this implementation and a separate S3 Go/No-Go.
   current generation/owner fence; an old generation never becomes valid again.
 - Unknown `W/K/S` combinations are `DENY`. `ALLOW` requires an immutable smoke
   report and deployment identity. Release validation parses the real expanded
-  Compose input, requires every image to use `@sha256`, and compares selected
-  images plus checksums of the actual config/flags files with that identity.
+  Compose input with the `migration` profile, requires exactly seven services
+  and every image to use `@sha256`, and compares selected images plus checksums
+  of the actual config/flags inputs with that identity.
+- `RELEASE_CONFIG_FILE` is the one canonical backend `KEY=VALUE` env file and
+  `RELEASE_FEATURE_FLAGS_FILE` is the one mounted flags file. Compose consumes
+  those exact paths; validation compares the expanded environment and mounts
+  to the normalized source without persisting or logging expanded secret
+  values. A side copy, path alias, tag, or changed content fails closed.
 
 ## Build artifacts
 
@@ -61,6 +67,24 @@ Failure leaves Web/Worker stopped or fenced; inspect the manifest, invalid
 concurrent indexes, pre-hooks, and backfill watermark, then forward-fix. Do not
 automatically run `migrate down`.
 
+The migrator uses the same `--profile migration` expansion and verified
+config/flags mounts as release validation. After `migrate up` exits zero it
+atomically writes `RELEASE_EXECUTION_DIR/migrator-execution.json`, bound to the
+verified deployment identity and actual input checksums. Runtime smoke reads
+that durable record after the one-shot container exits or is removed; it never
+depends on default `compose ps -q` finding a cleaned container. Missing,
+partial, failed, cross-release, or drifted records are rejected.
+
+```sh
+docker compose --profile migration \
+  -f deploy/bluegreen/docker-compose.transition.yml run --rm migrator
+test -s "$RELEASE_EXECUTION_DIR/migrator-execution.json"
+```
+
+`run --rm` is safe here because the final successful command writes the record
+through the host-mounted execution directory before Compose removes the
+container. Do not substitute an unprofiled `compose run` or a container label.
+
 ## Cutover
 
 1. Acquire the host release lock. Confirm immutable digests/checksums, an
@@ -75,9 +99,9 @@ automatically run `migrate down`.
 5. Validate a complete config using the candidate fragment while the live
    fragment is untouched. Only then atomically install, validate, and reload.
 6. Run the target ALLOW smoke (ten readiness successes, running-container
-   RepoDigest/release/config/flags/migration identity, and isolated critical
-   write), then atomically activate admission and claims in one DB transition.
-   A rejected activation leaves both gates closed.
+   RepoDigest/release/config/flags identity, durable completed-migrator identity,
+   and isolated critical write), then atomically activate admission and claims
+   in one DB transition. A rejected activation leaves both gates closed.
 7. Read old-Web WS counts directly from its loopback endpoint. Drain for up to
    five minutes and observe both versions for at least 60 minutes.
 
@@ -88,6 +112,10 @@ is fixed: close admission → drain green worker → verify drained → advance 
 generation fence → start blue worker claims-disabled → validate/reload the blue
 Caddy fragment → run `SMOKE-W0K0S1/S2` → atomically activate both gates.
 There is no open/enable intermediate state or weaker manual fallback.
+The management API exposes only `/activate` for opening both gates. The former
+`/enable-claims` and `/admission/open` routes return 404, and the corresponding
+`enable-claims` / `admission-open` CLI commands are unknown. `/admission/close`,
+drain, and complete-drain remain one-way fail-close operations.
 
 ## Observation and automatic action
 

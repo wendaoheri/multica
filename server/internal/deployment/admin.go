@@ -31,9 +31,7 @@ func NewAdminServer(addr string, store *ControlStore, controller *WorkerControll
 	mux.HandleFunc("GET /status", a.status)
 	mux.HandleFunc("POST /drain", a.drain)
 	mux.HandleFunc("POST /complete-drain", a.completeDrain)
-	mux.HandleFunc("POST /enable-claims", a.enableClaims)
 	mux.HandleFunc("POST /activate", a.activate)
-	mux.HandleFunc("POST /admission/open", a.openAdmission)
 	mux.HandleFunc("POST /admission/close", a.closeAdmission)
 	var handler http.Handler = mux
 	if loopbackErr != nil || token != "" {
@@ -101,14 +99,6 @@ func (a *AdminServer) drain(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "draining"})
 }
 
-func (a *AdminServer) enableClaims(w http.ResponseWriter, r *http.Request) {
-	if err := a.store.EnableClaims(r.Context(), a.generation, a.owner); err != nil {
-		writeControlError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusAccepted, map[string]string{"status": "claims_enabled"})
-}
-
 func (a *AdminServer) activate(w http.ResponseWriter, r *http.Request) {
 	if err := a.store.Activate(r.Context(), a.generation, a.owner); err != nil {
 		writeControlError(w, err)
@@ -117,20 +107,12 @@ func (a *AdminServer) activate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]any{"admission_open": true, "claims_enabled": true})
 }
 
-func (a *AdminServer) openAdmission(w http.ResponseWriter, r *http.Request) {
-	a.setAdmission(w, r, true)
-}
-
 func (a *AdminServer) closeAdmission(w http.ResponseWriter, r *http.Request) {
-	a.setAdmission(w, r, false)
-}
-
-func (a *AdminServer) setAdmission(w http.ResponseWriter, r *http.Request, open bool) {
-	if err := a.store.SetAdmission(r.Context(), a.generation, open); err != nil {
+	if err := a.store.CloseAdmission(r.Context(), a.generation); err != nil {
 		writeControlError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"admission_open": open})
+	writeJSON(w, http.StatusAccepted, map[string]any{"admission_open": false})
 }
 
 func (a *AdminServer) String() string {

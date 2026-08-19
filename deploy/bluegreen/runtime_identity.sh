@@ -5,6 +5,7 @@ set -eu
 : "${COMPOSE_FILE:?set COMPOSE_FILE}"
 : "${RELEASE_MANIFEST:?set RELEASE_MANIFEST}"
 : "${RUNTIME_IDENTITY_REPORT:?set RUNTIME_IDENTITY_REPORT}"
+: "${MIGRATOR_EXECUTION_RECORD:?set MIGRATOR_EXECUTION_RECORD from the completed one-shot migrator}"
 
 case "$COMBINATION" in
   W0*) web=blue-web; frontend=blue-frontend ;; W1*) web=green-web; frontend=green-frontend ;; *) exit 2 ;;
@@ -15,7 +16,7 @@ esac
 
 inspect_digest() {
   service=$1
-  container=$(docker compose -f "$COMPOSE_FILE" ps -q "$service")
+  container=$(docker compose --profile migration -f "$COMPOSE_FILE" ps -q "$service")
   test -n "$container"
   expected=$(jq -er --arg c "$COMBINATION" --arg field "$2" '.combinations[$c].deployment[$field]' "$RELEASE_MANIFEST")
   docker inspect "$container" --format '{{json .RepoDigests}}' | jq -e --arg expected "$expected" 'index($expected) != null' >/dev/null
@@ -31,7 +32,12 @@ inspect_digest() {
 web_image=$(inspect_digest "$web" web_image)
 worker_image=$(inspect_digest "$worker" worker_image)
 frontend_image=$(inspect_digest "$frontend" frontend_image)
-migrator_image=$(inspect_digest migrator migrator_image)
+jq -e --arg combination "$COMBINATION" --slurpfile manifest "$RELEASE_MANIFEST" '
+  .version == 1 and .result == "PASS" and
+  .release_id == $manifest[0].release_id and .combination == $combination and
+  .deployment == $manifest[0].combinations[$combination].deployment
+' "$MIGRATOR_EXECUTION_RECORD" >/dev/null
+migrator_image=$(jq -er '.deployment.migrator_image' "$MIGRATOR_EXECUTION_RECORD")
 jq -n --arg combination "$COMBINATION" --arg web "$web_image" --arg worker "$worker_image" \
   --arg frontend "$frontend_image" --arg migrator "$migrator_image" --slurpfile manifest "$RELEASE_MANIFEST" '
   {release_id:$manifest[0].release_id,combination:$combination,

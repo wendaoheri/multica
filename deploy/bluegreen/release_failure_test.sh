@@ -4,7 +4,7 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT HUP INT TERM
-mkdir "$work/bin" "$work/artifacts"
+mkdir "$work/bin" "$work/artifacts" "$work/execution"
 log="$work/actions.log"
 live="$work/live.fragment"
 blue="$work/blue.fragment"
@@ -66,6 +66,7 @@ chmod +x "$work/bin/"*
 run_release() {
   PATH="$work/bin:$PATH" ACTION_LOG="$log" LIVE_FRAGMENT="$live" \
   RELEASE_ARTIFACT_DIR="$work/artifacts" TARGET_COMBINATION=W1K1S1 \
+  RELEASE_EXECUTION_DIR="$work/execution" \
   RELEASE_CONFIG_FILE="$work/config.actual" RELEASE_FEATURE_FLAGS_FILE="$work/flags.actual" \
   COMPOSE_FILE="$work/compose.yml" CADDY_CONFIG="$config" \
   CADDY_MANAGED_FRAGMENT="$live" CADDY_BIN=caddy RELEASECTL=releasectl \

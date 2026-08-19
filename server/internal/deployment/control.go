@@ -59,7 +59,7 @@ func (s *ControlStore) Load(ctx context.Context) (ControlSnapshot, error) {
 }
 
 // AdvanceGeneration permanently fences the previous worker owner and closes
-// both task admission and claims. Re-opening either side is a separate,
+// both task admission and claims. Activate re-opens both in one atomic,
 // auditable operation after the new generation's smoke passes.
 func (s *ControlStore) AdvanceGeneration(ctx context.Context, expected int64) (ControlSnapshot, error) {
 	row := s.pool.QueryRow(ctx, `
@@ -88,11 +88,13 @@ func (s *ControlStore) AdvanceGeneration(ctx context.Context, expected int64) (C
 	return snapshot, err
 }
 
-func (s *ControlStore) SetAdmission(ctx context.Context, generation int64, open bool) error {
+// CloseAdmission is deliberately one-way. Activation is the only public
+// operation that can open admission, and it opens claims in the same SQL write.
+func (s *ControlStore) CloseAdmission(ctx context.Context, generation int64) error {
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE deployment_release_control
-		SET admission_open = $2, updated_at = NOW()
-		WHERE singleton = TRUE AND active_generation = $1`, generation, open)
+		SET admission_open = FALSE, updated_at = NOW()
+		WHERE singleton = TRUE AND active_generation = $1`, generation)
 	if err != nil {
 		return err
 	}
@@ -100,40 +102,6 @@ func (s *ControlStore) SetAdmission(ctx context.Context, generation int64, open 
 		return ErrGenerationMismatch
 	}
 	return nil
-}
-
-// EnableClaims atomically binds the active generation to one worker instance.
-// A second worker cannot become active merely by sharing the generation value.
-func (s *ControlStore) EnableClaims(ctx context.Context, generation int64, owner string) error {
-	if owner == "" {
-		return fmt.Errorf("worker owner is required")
-	}
-	tag, err := s.pool.Exec(ctx, `
-		UPDATE deployment_release_control
-		SET claims_enabled = TRUE,
-		    worker_owner = $2,
-		    worker_heartbeat_at = NOW(),
-		    updated_at = NOW()
-		WHERE singleton = TRUE
-		  AND active_generation = $1
-		  AND drain_requested = FALSE
-		  AND worker_in_flight = 0
-		  AND worker_leases = 0
-		  AND (worker_owner IS NULL OR worker_owner = $2)`, generation, owner)
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 1 {
-		return nil
-	}
-	snapshot, loadErr := s.Load(ctx)
-	if loadErr != nil {
-		return loadErr
-	}
-	if snapshot.ActiveGeneration != generation {
-		return ErrGenerationMismatch
-	}
-	return ErrWorkerOwned
 }
 
 // Activate atomically opens admission and claims for exactly one generation

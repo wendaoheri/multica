@@ -3,17 +3,14 @@ name: multica-transition
 x-backend: &backend
   restart: unless-stopped
   env_file:
-    - ${MULTICA_RELEASE_ENV_FILE:?set MULTICA_RELEASE_ENV_FILE}
+    - ${RELEASE_CONFIG_FILE:?set RELEASE_CONFIG_FILE}
   environment: &backend-env
-    DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL}
-    REDIS_URL: ${REDIS_URL:?set REDIS_URL}
     MULTICA_AUTO_MIGRATE: "false"
-    REALTIME_RELAY_MODE: sharded
-    REALTIME_RELAY_MAX_CONSUMER_LAG: ${REALTIME_RELAY_MAX_CONSUMER_LAG:-30s}
-    REALTIME_RELAY_CONSUMER_FAILURE_LIMIT: ${REALTIME_RELAY_CONSUMER_FAILURE_LIMIT:-3}
-    REALTIME_RELAY_CONSUMER_RECOVERY_LIMIT: ${REALTIME_RELAY_CONSUMER_RECOVERY_LIMIT:-2}
-  volumes:
+    MULTICA_FEATURE_FLAGS_FILE: /run/multica-release/feature-flags.yaml
+  volumes: &backend-volumes
     - uploads:/app/data/uploads
+    - ${RELEASE_CONFIG_FILE}:/run/multica-release/config.env:ro
+    - ${RELEASE_FEATURE_FLAGS_FILE:?set RELEASE_FEATURE_FLAGS_FILE}:/run/multica-release/feature-flags.yaml:ro
   networks:
     - state
   labels: &release-labels
@@ -105,6 +102,9 @@ services:
       PGOPTIONS: -c lock_timeout=3s -c statement_timeout=15min
     volumes:
       - ${RELEASE_ARTIFACT_DIR:?set RELEASE_ARTIFACT_DIR}:/release:ro
+      - ${RELEASE_EXECUTION_DIR:?set RELEASE_EXECUTION_DIR}:/release-execution
+      - ${RELEASE_CONFIG_FILE}:/run/multica-release/config.env:ro
+      - ${RELEASE_FEATURE_FLAGS_FILE}:/run/multica-release/feature-flags.yaml:ro
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - >-
@@ -114,14 +114,15 @@ services:
         --require-combination ${TARGET_COMBINATION:?set TARGET_COMBINATION}
         --migration-dir /app/migrations
         --check-database
-        && ./releasectl verify-deployment
+        && timeout 1200 ./migrate up
+        && ./releasectl record-migrator-execution
         --manifest /release/manifest.json
         --artifact-dir /release
         --combination ${TARGET_COMBINATION}
-        --compose-json /release/compose.actual.json
-        --config-file /release/config.actual
-        --feature-flags-file /release/flags.actual
-        && timeout 1200 ./migrate up
+        --deployment-identity /release/deployment.actual.json
+        --config-file /run/multica-release/config.env
+        --feature-flags-file /run/multica-release/feature-flags.yaml
+        --output /release-execution/migrator-execution.json
 
 volumes:
   uploads:

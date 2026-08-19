@@ -36,6 +36,14 @@ grep -q 'REDIS_URL is required for web/worker split roles' "$work/no-redis.log"
 
 "$work/releasectl" status | jq -e \
   '.active_generation == 1 and .claims_enabled == false and .admission_open == false' >/dev/null
+for removed in admission-open enable-claims; do
+  if "$work/releasectl" "$removed" --generation 1 --owner worker-a >/dev/null 2>&1; then
+    echo "removed command $removed unexpectedly succeeded" >&2
+    exit 1
+  fi
+done
+"$work/releasectl" status | jq -e \
+  '.active_generation == 1 and .claims_enabled == false and .admission_open == false and .worker_owner == null' >/dev/null
 if "$work/releasectl" activate --generation 2 --owner worker-a >/dev/null 2>&1; then
   echo "wrong-generation activation unexpectedly succeeded" >&2
   exit 1
@@ -48,8 +56,8 @@ if "$work/releasectl" activate --generation 1 --owner worker-b >/dev/null 2>&1; 
   exit 1
 fi
 "$work/releasectl" drain --generation 1 --owner worker-a >/dev/null
-if "$work/releasectl" enable-claims --generation 1 --owner worker-b >/dev/null 2>&1; then
-  echo "replacement worker enabled while old owner was draining" >&2
+if "$work/releasectl" activate --generation 1 --owner worker-b >/dev/null 2>&1; then
+  echo "replacement worker activated while old owner was draining" >&2
   exit 1
 fi
 if "$work/releasectl" complete-drain --generation 1 --owner worker-a >/dev/null 2>&1; then
@@ -61,12 +69,12 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c \
 "$work/releasectl" complete-drain --generation 1 --owner worker-a >/dev/null
 "$work/releasectl" advance-generation --generation 1 | jq -e \
   '.active_generation == 2 and .claims_enabled == false and .admission_open == false' >/dev/null
-if "$work/releasectl" enable-claims --generation 1 --owner worker-a >/dev/null 2>&1; then
-  echo "fenced generation unexpectedly enabled" >&2
+if "$work/releasectl" activate --generation 1 --owner worker-a >/dev/null 2>&1; then
+  echo "fenced generation unexpectedly activated" >&2
   exit 1
 fi
 
-"$work/releasectl" enable-claims --generation 2 --owner worker-c >/dev/null
+"$work/releasectl" activate --generation 2 --owner worker-c >/dev/null
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c \
   "UPDATE deployment_release_control SET worker_in_flight = 1 WHERE singleton" >/dev/null
 "$work/releasectl" drain --generation 2 --owner worker-c >/dev/null
@@ -80,7 +88,7 @@ psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c \
   "UPDATE deployment_release_control SET worker_in_flight = 0, drain_zero_since = NOW() - INTERVAL '61 seconds' WHERE singleton" >/dev/null
 "$work/releasectl" complete-drain --generation 2 --owner worker-c >/dev/null
 "$work/releasectl" advance-generation --generation 2 >/dev/null
-if "$work/releasectl" enable-claims --generation 2 --owner worker-c >/dev/null 2>&1; then
+if "$work/releasectl" activate --generation 2 --owner worker-c >/dev/null 2>&1; then
   echo "old generation operation became valid again" >&2
   exit 1
 fi
@@ -134,4 +142,4 @@ if "$work/releasectl" verify-manifest \
   exit 1
 fi
 
-echo "PostgreSQL generation/owner/drain fence, strict migration set, manifest target DENY, and drift injection: PASS"
+echo "PostgreSQL atomic activation, removed CLI state invariance, generation/owner/drain fence, strict migration set, manifest target DENY, and drift injection: PASS"

@@ -26,3 +26,20 @@ func TestAdminServerRemoteBindRequiresBearerToken(t *testing.T) {
 		t.Fatalf("status = %d, want 401", w.Code)
 	}
 }
+
+func TestAdminServerRejectsRemovedSplitActivationRoutes(t *testing.T) {
+	server, err := NewAdminServer("127.0.0.1:9091", nil, nil, 1, "worker", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/enable-claims", "/admission/open"} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, path, nil)
+			w := httptest.NewRecorder()
+			server.server.Handler.ServeHTTP(w, req)
+			if w.Code != http.StatusNotFound {
+				t.Fatalf("status = %d, want 404", w.Code)
+			}
+		})
+	}
+}

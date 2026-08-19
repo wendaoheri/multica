@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multica-ai/multica/server/internal/deployment"
@@ -44,6 +45,15 @@ func main() {
 		fmt.Println(sum)
 		return
 	}
+	if os.Args[1] == "record-migrator-execution" {
+		recordMigratorExecution(os.Args[2:])
+		return
+	}
+	switch os.Args[1] {
+	case "status", "advance-generation", "admission-close", "activate", "drain", "complete-drain":
+	default:
+		usage()
+	}
 
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
@@ -70,24 +80,12 @@ func main() {
 			fatal(err)
 		}
 		printJSON(snapshot)
-	case "admission-open", "admission-close":
+	case "admission-close":
 		generation := requiredGeneration(os.Args[2:])
-		if err := store.SetAdmission(context.Background(), generation, os.Args[1] == "admission-open"); err != nil {
+		if err := store.CloseAdmission(context.Background(), generation); err != nil {
 			fatal(err)
 		}
-		printJSON(map[string]any{"generation": generation, "admission_open": os.Args[1] == "admission-open"})
-	case "enable-claims":
-		fs := flag.NewFlagSet("enable-claims", flag.ExitOnError)
-		generation := fs.Int64("generation", 0, "expected active generation")
-		owner := fs.String("owner", "", "worker instance owner id")
-		_ = fs.Parse(os.Args[2:])
-		if *generation <= 0 || *owner == "" {
-			fatal(errors.New("--generation and --owner are required"))
-		}
-		if err := store.EnableClaims(context.Background(), *generation, *owner); err != nil {
-			fatal(err)
-		}
-		printJSON(map[string]any{"generation": *generation, "owner": *owner, "claims_enabled": true})
+		printJSON(map[string]any{"generation": generation, "admission_open": false})
 	case "activate":
 		fs := flag.NewFlagSet("activate", flag.ExitOnError)
 		generation := fs.Int64("generation", 0, "expected active generation")
@@ -128,6 +126,32 @@ func main() {
 	default:
 		usage()
 	}
+}
+
+func recordMigratorExecution(args []string) {
+	fs := flag.NewFlagSet("record-migrator-execution", flag.ExitOnError)
+	manifestPath := fs.String("manifest", "", "release manifest JSON")
+	artifactDir := fs.String("artifact-dir", "", "smoke artifact directory")
+	combination := fs.String("combination", "", "actual W/K/S combination")
+	identity := fs.String("deployment-identity", "", "verified deployment identity JSON")
+	config := fs.String("config-file", "", "actual effective config")
+	flags := fs.String("feature-flags-file", "", "actual effective flags")
+	output := fs.String("output", "", "durable one-shot execution record")
+	_ = fs.Parse(args)
+	if *manifestPath == "" || *combination == "" || *identity == "" || *config == "" || *flags == "" || *output == "" {
+		fatal(errors.New("all record-migrator-execution flags are required"))
+	}
+	if *artifactDir == "" {
+		*artifactDir = filepath.Dir(*manifestPath)
+	}
+	manifest, err := releasecompat.Load(*manifestPath)
+	if err != nil {
+		fatal(err)
+	}
+	if err := releasecompat.RecordMigratorExecution(manifest, *artifactDir, *combination, *identity, *config, *flags, *output, time.Now()); err != nil {
+		fatal(err)
+	}
+	printJSON(map[string]any{"status": "recorded", "release_id": manifest.ReleaseID, "combination": *combination})
 }
 
 func verifyDeployment(args []string) {
@@ -329,6 +353,6 @@ func fatal(err error) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: releasectl <status|advance-generation|admission-open|admission-close|enable-claims|drain|complete-drain|generate-manifest|verify-manifest>")
+	fmt.Fprintln(os.Stderr, "usage: releasectl <status|advance-generation|admission-close|activate|drain|complete-drain|generate-manifest|verify-manifest|verify-deployment|record-migrator-execution|checksum>")
 	os.Exit(2)
 }

@@ -74,4 +74,11 @@ func TestVerifyDeploymentBindsActualExpandedInputs(t *testing.T) {
 			t.Fatal("config drift accepted")
 		}
 	})
+	_ = os.WriteFile(config, []byte("actual-config\n"), 0o600)
+	t.Run("flags drift", func(t *testing.T) {
+		_ = os.WriteFile(flags, []byte("drift"), 0o600)
+		if _, err := VerifyDeployment(m, dir, "W1K1S1", compose, config, flags); err == nil {
+			t.Fatal("flags drift accepted")
+		}
+	})
 }

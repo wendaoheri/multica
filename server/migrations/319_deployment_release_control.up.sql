@@ -5,6 +5,10 @@ CREATE TABLE deployment_release_control (
     admission_open BOOLEAN NOT NULL DEFAULT FALSE,
     worker_owner TEXT,
     worker_heartbeat_at TIMESTAMPTZ,
+    drain_requested BOOLEAN NOT NULL DEFAULT FALSE,
+    worker_in_flight BIGINT NOT NULL DEFAULT 0 CHECK (worker_in_flight >= 0),
+    worker_leases BIGINT NOT NULL DEFAULT 0 CHECK (worker_leases >= 0),
+    drain_zero_since TIMESTAMPTZ,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 

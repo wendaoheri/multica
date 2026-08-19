@@ -34,6 +34,13 @@ chmod +x "$work/migrate" "$work/server"
     exit 1
   fi
   test ! -s calls
+
+  : >calls
+  if MULTICA_PROCESS_ROLE=workre MULTICA_AUTO_MIGRATE=true ./entrypoint.sh; then
+    echo "unknown role unexpectedly succeeded" >&2
+    exit 1
+  fi
+  test ! -s calls
 )
 
 echo "entrypoint role/migration isolation: PASS"

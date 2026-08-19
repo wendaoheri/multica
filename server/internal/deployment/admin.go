@@ -30,6 +30,7 @@ func NewAdminServer(addr string, store *ControlStore, controller *WorkerControll
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /status", a.status)
 	mux.HandleFunc("POST /drain", a.drain)
+	mux.HandleFunc("POST /complete-drain", a.completeDrain)
 	mux.HandleFunc("POST /enable-claims", a.enableClaims)
 	mux.HandleFunc("POST /admission/open", a.openAdmission)
 	mux.HandleFunc("POST /admission/close", a.closeAdmission)
@@ -64,10 +65,18 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 
 func writeControlError(w http.ResponseWriter, err error) {
 	status := http.StatusInternalServerError
-	if errors.Is(err, ErrGenerationMismatch) || errors.Is(err, ErrWorkerOwned) {
+	if errors.Is(err, ErrGenerationMismatch) || errors.Is(err, ErrWorkerOwned) || errors.Is(err, ErrDrainIncomplete) {
 		status = http.StatusConflict
 	}
 	writeJSON(w, status, map[string]string{"error": err.Error()})
+}
+
+func (a *AdminServer) completeDrain(w http.ResponseWriter, r *http.Request) {
+	if err := a.store.CompleteDrain(r.Context(), a.generation, a.owner, DrainObservationWindow); err != nil {
+		writeControlError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "drained_owner_released"})
 }
 
 func (a *AdminServer) status(w http.ResponseWriter, _ *http.Request) {

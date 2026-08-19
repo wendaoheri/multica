@@ -68,6 +68,9 @@ func shardedRelayConfigFromEnv() realtime.ShardedStreamRelayConfig {
 	cfg.ReadCount = envPositiveInt64("REALTIME_RELAY_XREAD_COUNT", cfg.ReadCount)
 	cfg.ReadBlock = envDuration("REALTIME_RELAY_XREAD_BLOCK", cfg.ReadBlock)
 	cfg.ReplayGrace = envDuration("REALTIME_RELAY_REPLAY_GRACE", cfg.ReplayGrace)
+	cfg.MaxConsumerLag = envDuration("REALTIME_RELAY_MAX_CONSUMER_LAG", cfg.MaxConsumerLag)
+	cfg.ConsumerFailureLimit = envPositiveInt("REALTIME_RELAY_CONSUMER_FAILURE_LIMIT", cfg.ConsumerFailureLimit)
+	cfg.ConsumerRecoveryLimit = envPositiveInt("REALTIME_RELAY_CONSUMER_RECOVERY_LIMIT", cfg.ConsumerRecoveryLimit)
 	return cfg
 }
 
@@ -266,6 +269,7 @@ func main() {
 	var legacyReadRedis *redis.Client
 	var prQueueRedis *redis.Client
 	var relay realtime.ManagedRelay
+	var runtimeRelayHealth func(context.Context) error
 	relayHealthy := func(context.Context) error { return fmt.Errorf("Redis relay is not configured") }
 	defer func() {
 		if relay != nil {
@@ -348,6 +352,7 @@ func main() {
 				shardedReadRedis = newNamedRedisClient(opts, "realtime-read-sharded")
 				legacyReadRedis = newNamedRedisClient(opts, "realtime-read-legacy")
 				sharded := realtime.NewShardedStreamRelay(hub, relayWriteRedis, shardedReadRedis, relayConfig)
+				runtimeRelayHealth = sharded.Health
 				if role.RunsWeb() {
 					sharded.SetDaemonRuntimeDeliverer(daemonHub)
 				}
@@ -361,6 +366,7 @@ func main() {
 			default:
 				relayReadRedis = newNamedRedisClient(opts, "realtime-read")
 				sharded := realtime.NewShardedStreamRelay(hub, relayWriteRedis, relayReadRedis, relayConfig)
+				runtimeRelayHealth = sharded.Health
 				if role.RunsWeb() {
 					sharded.SetDaemonRuntimeDeliverer(daemonHub)
 				}
@@ -377,8 +383,10 @@ func main() {
 				if err := baseRelayProbe(probeCtx); err != nil {
 					return err
 				}
-				if !realtime.M.RedisConnected.Load() {
-					return fmt.Errorf("Redis relay consumer is not healthy")
+				if runtimeRelayHealth != nil {
+					if err := runtimeRelayHealth(probeCtx); err != nil {
+						return err
+					}
 				}
 				return nil
 			}
@@ -526,13 +534,13 @@ func main() {
 		liveness = handler.NewRedisLivenessStore(storeRedis)
 	}
 
-	workerRun := func(runCtx context.Context) error {
-		return runBackgroundComposition(runCtx, pool, queries, h, taskSvc, autopilotSvc, bus, liveness, channelMediaMetrics)
+	workerRun := func(runCtx context.Context, fence deployment.OperationFence) error {
+		return runBackgroundComposition(runCtx, pool, queries, h, taskSvc, autopilotSvc, bus, liveness, channelMediaMetrics, fence)
 	}
 	var adminServer *deployment.AdminServer
 	if role == deployment.RoleAll {
 		go func() {
-			if err := workerRun(sweepCtx); err != nil && err != context.Canceled {
+			if err := workerRun(sweepCtx, nil); err != nil && err != context.Canceled {
 				slog.Warn("background composition stopped", "error", err)
 			}
 		}()
@@ -563,7 +571,7 @@ func main() {
 			}
 		}()
 		go func() {
-			if err := controller.Run(sweepCtx, workerRun); err != nil && err != context.Canceled {
+			if err := controller.Run(sweepCtx, func(runCtx context.Context) error { return workerRun(runCtx, controller) }); err != nil && err != context.Canceled {
 				slog.Warn("worker composition fenced or drained", "error", err, "status", controller.Status())
 			}
 		}()

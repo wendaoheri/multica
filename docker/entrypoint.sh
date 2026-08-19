@@ -5,11 +5,18 @@ set -e
 # Web/Worker roles never migrate on application startup: a release must run the
 # checked one-shot migrator after validating its immutable manifest.
 role="${MULTICA_PROCESS_ROLE:-all}"
+case "$role" in
+  all|web|worker) ;;
+  *)
+    echo "MULTICA_PROCESS_ROLE must be one of: all, web, worker" >&2
+    exit 1
+    ;;
+esac
 auto_migrate="${MULTICA_AUTO_MIGRATE:-}"
 if [ -z "$auto_migrate" ]; then
   case "$role" in
     web|worker) auto_migrate=false ;;
-    *) auto_migrate=true ;;
+    all) auto_migrate=true ;;
   esac
 fi
 case "$role:$auto_migrate" in

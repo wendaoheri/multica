@@ -42,10 +42,40 @@ if "$work/releasectl" enable-claims --generation 1 --owner worker-b >/dev/null 2
   exit 1
 fi
 "$work/releasectl" drain --generation 1 --owner worker-a >/dev/null
+if "$work/releasectl" enable-claims --generation 1 --owner worker-b >/dev/null 2>&1; then
+  echo "replacement worker enabled while old owner was draining" >&2
+  exit 1
+fi
+if "$work/releasectl" complete-drain --generation 1 --owner worker-a >/dev/null 2>&1; then
+  echo "drain completed without the continuous observation window" >&2
+  exit 1
+fi
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c \
+  "UPDATE deployment_release_control SET drain_zero_since = NOW() - INTERVAL '61 seconds' WHERE singleton" >/dev/null
+"$work/releasectl" complete-drain --generation 1 --owner worker-a >/dev/null
 "$work/releasectl" advance-generation --generation 1 | jq -e \
   '.active_generation == 2 and .claims_enabled == false and .admission_open == false' >/dev/null
 if "$work/releasectl" enable-claims --generation 1 --owner worker-a >/dev/null 2>&1; then
   echo "fenced generation unexpectedly enabled" >&2
+  exit 1
+fi
+
+"$work/releasectl" enable-claims --generation 2 --owner worker-c >/dev/null
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c \
+  "UPDATE deployment_release_control SET worker_in_flight = 1 WHERE singleton" >/dev/null
+"$work/releasectl" drain --generation 2 --owner worker-c >/dev/null
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c \
+  "UPDATE deployment_release_control SET drain_zero_since = NOW() - INTERVAL '61 seconds' WHERE singleton" >/dev/null
+if "$work/releasectl" complete-drain --generation 2 --owner worker-c >/dev/null 2>&1; then
+  echo "drain completed with an in-flight operation" >&2
+  exit 1
+fi
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c \
+  "UPDATE deployment_release_control SET worker_in_flight = 0, drain_zero_since = NOW() - INTERVAL '61 seconds' WHERE singleton" >/dev/null
+"$work/releasectl" complete-drain --generation 2 --owner worker-c >/dev/null
+"$work/releasectl" advance-generation --generation 2 >/dev/null
+if "$work/releasectl" enable-claims --generation 2 --owner worker-c >/dev/null 2>&1; then
+  echo "old generation operation became valid again" >&2
   exit 1
 fi
 
@@ -66,6 +96,26 @@ digest=0000000000000000000000000000000000000000000000000000000000000000
   --artifact-dir "$work" \
   --migration-dir "$work/migrations" \
   --check-database >/dev/null
+if "$work/releasectl" verify-manifest \
+  --manifest "$work/manifest.json" \
+  --artifact-dir "$work" \
+  --require-combination W1K1S1 >/dev/null 2>&1; then
+  echo "all-DENY manifest unexpectedly authorized the target" >&2
+  exit 1
+fi
+
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c \
+  "INSERT INTO schema_migrations(version) VALUES ('999_unknown_per376')" >/dev/null
+if "$work/releasectl" verify-manifest \
+  --manifest "$work/manifest.json" \
+  --artifact-dir "$work" \
+  --migration-dir "$work/migrations" \
+  --check-database >/dev/null 2>&1; then
+  echo "unknown database migration version unexpectedly passed" >&2
+  exit 1
+fi
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c \
+  "DELETE FROM schema_migrations WHERE version = '999_unknown_per376'" >/dev/null
 
 cp -R "$work/migrations" "$work/migrations-drift"
 printf '\n-- injected drift\n' >>"$work/migrations-drift/320_deployment_release_control_singleton_index.up.sql"
@@ -78,4 +128,4 @@ if "$work/releasectl" verify-manifest \
   exit 1
 fi
 
-echo "PostgreSQL generation fence, owner exclusion, manifest, and drift injection: PASS"
+echo "PostgreSQL generation/owner/drain fence, strict migration set, manifest target DENY, and drift injection: PASS"

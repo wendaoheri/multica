@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/multica-ai/multica/server/internal/deployment"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/handler"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
@@ -27,20 +28,62 @@ func runBackgroundComposition(
 	bus *events.Bus,
 	liveness handler.LivenessStore,
 	channelMediaMetrics *obsmetrics.ChannelMediaReconcilerMetrics,
+	fence deployment.OperationFence,
 ) error {
-	go runRuntimeSweeper(ctx, pool, queries, liveness, taskSvc, bus)
-	go runAutopilotFailureMonitor(ctx, queries, bus, envFailureMonitorConfig())
-	go runDBStatsLogger(ctx, pool)
-	if h.WebhookDeliveryWorker != nil {
-		go h.WebhookDeliveryWorker.Run(ctx)
+	compositionCtx, cancelComposition := context.WithCancel(ctx)
+	defer cancelComposition()
+	componentErr := make(chan error, 8)
+	goComponent := func(kind string, lease bool, run func(context.Context) error) {
+		go func() {
+			var err error
+			if fence != nil {
+				err = fence.RunFenced(compositionCtx, kind, lease, run)
+			} else {
+				err = run(compositionCtx)
+			}
+			if err != nil && err != context.Canceled {
+				select {
+				case componentErr <- err:
+				default:
+				}
+			}
+		}()
 	}
-	h.PRRefresh.Start(ctx)
+	goComponent("runtime-sweeper", false, func(runCtx context.Context) error {
+		runRuntimeSweeper(runCtx, pool, queries, liveness, taskSvc, bus)
+		return runCtx.Err()
+	})
+	goComponent("autopilot-failure-monitor", false, func(runCtx context.Context) error {
+		runAutopilotFailureMonitor(runCtx, queries, bus, envFailureMonitorConfig())
+		return runCtx.Err()
+	})
+	goComponent("db-stats", false, func(runCtx context.Context) error {
+		runDBStatsLogger(runCtx, pool)
+		return runCtx.Err()
+	})
+	if h.WebhookDeliveryWorker != nil {
+		goComponent("webhook-delivery", true, func(runCtx context.Context) error {
+			h.WebhookDeliveryWorker.Run(runCtx)
+			return runCtx.Err()
+		})
+	}
+	goComponent("pr-refresh", true, func(runCtx context.Context) error {
+		h.PRRefresh.Start(runCtx)
+		<-runCtx.Done()
+		return runCtx.Err()
+	})
 	if h.ChannelSupervisor != nil {
-		go h.ChannelSupervisor.Run(ctx)
+		goComponent("channel-supervisor", true, func(runCtx context.Context) error {
+			h.ChannelSupervisor.Run(runCtx)
+			return runCtx.Err()
+		})
 	}
 	if h.ChannelMediaReconciler != nil {
 		h.ChannelMediaReconciler.Metrics = channelMediaMetrics
-		go h.ChannelMediaReconciler.Run(ctx)
+		goComponent("channel-media", true, func(runCtx context.Context) error {
+			h.ChannelMediaReconciler.Run(runCtx)
+			return runCtx.Err()
+		})
 	}
 
 	schedulerMgr := scheduler.NewManager(pool, scheduler.Options{})
@@ -50,10 +93,14 @@ func runBackgroundComposition(
 	if err := schedulerMgr.Register(scheduler.AutopilotScheduleDispatchJob(pool, queries, autopilotSvc)); err != nil {
 		return err
 	}
-	schedulerDone := make(chan error, 1)
-	go func() { schedulerDone <- schedulerMgr.Run(ctx) }()
+	goComponent("scheduler", true, schedulerMgr.Run)
 
-	<-ctx.Done()
+	select {
+	case <-ctx.Done():
+	case err := <-componentErr:
+		cancelComposition()
+		return err
+	}
 	if h.WebhookDeliveryWorker != nil && !h.WebhookDeliveryWorker.WaitWithTimeout(5*time.Second) {
 		slog.Warn("webhook delivery worker did not exit within drain timeout")
 	}
@@ -69,10 +116,5 @@ func runBackgroundComposition(
 			cancel()
 		}
 	}
-	select {
-	case err := <-schedulerDone:
-		return err
-	case <-time.After(5 * time.Second):
-		return context.DeadlineExceeded
-	}
+	return ctx.Err()
 }

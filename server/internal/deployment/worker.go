@@ -2,6 +2,8 @@ package deployment
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -24,6 +26,9 @@ type WorkerStatus struct {
 	AcceptingNew       bool        `json:"accepting_new"`
 	Owner              string      `json:"owner"`
 	LastError          string      `json:"last_error,omitempty"`
+	InFlight           int64       `json:"in_flight"`
+	Leases             int64       `json:"leases"`
+	DrainZeroSince     *time.Time  `json:"drain_zero_since,omitempty"`
 }
 
 type WorkerController struct {
@@ -39,7 +44,16 @@ type WorkerController struct {
 
 type workerControlStore interface {
 	Load(context.Context) (ControlSnapshot, error)
+	Drain(context.Context, int64, string) error
 	Heartbeat(context.Context, int64, string) error
+	AcquireOperation(context.Context, int64, string) error
+	ReleaseOperation(context.Context, int64, string) error
+	AcquireLease(context.Context, int64, string) error
+	ReleaseLease(context.Context, int64, string) error
+}
+
+type OperationFence interface {
+	RunFenced(context.Context, string, bool, func(context.Context) error) error
 }
 
 func NewWorkerController(store workerControlStore, generation int64, owner string, relayOK func(context.Context) error) *WorkerController {
@@ -65,6 +79,29 @@ func (c *WorkerController) update(fn func(*WorkerStatus)) {
 	fn(&c.status)
 }
 
+// RunFenced binds one controlled background loop to this generation and owner.
+// lease=true is used by claim/lease-bearing loops (scheduler, webhook, PR and
+// channel/media); false is used by bounded sweeps. Drain cannot release owner
+// until every acquired token is returned.
+func (c *WorkerController) RunFenced(ctx context.Context, kind string, lease bool, run func(context.Context) error) error {
+	acquire := c.store.AcquireOperation
+	release := c.store.ReleaseOperation
+	if lease {
+		acquire = c.store.AcquireLease
+		release = c.store.ReleaseLease
+	}
+	if err := acquire(ctx, c.generation, c.owner); err != nil {
+		return fmt.Errorf("acquire %s generation fence: %w", kind, err)
+	}
+	err := run(ctx)
+	releaseCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if releaseErr := release(releaseCtx, c.generation, c.owner); releaseErr != nil && !errors.Is(releaseErr, ErrGenerationMismatch) {
+		return errors.Join(err, fmt.Errorf("release %s generation fence: %w", kind, releaseErr))
+	}
+	return err
+}
+
 // Run waits in claims-disabled state, starts the supplied worker composition
 // exactly once after the DB fence binds this owner, and cancels it immediately
 // on drain, generation change, relay failure, or control-plane read failure.
@@ -74,6 +111,7 @@ func (c *WorkerController) Run(ctx context.Context, run func(context.Context) er
 	for {
 		if err := c.relayOK(ctx); err != nil {
 			c.update(func(s *WorkerStatus) { s.State = WorkerRelayUnhealthy; s.LastError = err.Error() })
+			_ = c.store.Drain(context.Background(), c.generation, c.owner)
 			return err
 		}
 		snapshot, err := c.store.Load(ctx)
@@ -81,7 +119,12 @@ func (c *WorkerController) Run(ctx context.Context, run func(context.Context) er
 			c.update(func(s *WorkerStatus) { s.State = WorkerFenced; s.LastError = err.Error() })
 			return err
 		}
-		c.update(func(s *WorkerStatus) { s.ActiveGeneration = snapshot.ActiveGeneration })
+		c.update(func(s *WorkerStatus) {
+			s.ActiveGeneration = snapshot.ActiveGeneration
+			s.InFlight = snapshot.WorkerInFlight
+			s.Leases = snapshot.WorkerLeases
+			s.DrainZeroSince = snapshot.DrainZeroSince
+		})
 		if snapshot.ActiveGeneration != c.generation {
 			c.update(func(s *WorkerStatus) { s.State = WorkerFenced })
 			return ErrGenerationMismatch
@@ -97,6 +140,7 @@ func (c *WorkerController) Run(ctx context.Context, run func(context.Context) er
 	}
 
 	workerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	done := make(chan error, 1)
 	c.update(func(s *WorkerStatus) { s.State = WorkerRunning; s.AcceptingNew = true; s.LastError = "" })
 	go func() { done <- run(workerCtx) }()
@@ -119,9 +163,40 @@ func (c *WorkerController) Run(ctx context.Context, run func(context.Context) er
 				s.AcceptingNew = false
 				s.LastError = err.Error()
 			})
+			_ = c.store.Drain(context.Background(), c.generation, c.owner)
 			cancel()
 			<-done
 			return err
+		}
+		snapshot, err := c.store.Load(ctx)
+		if err == nil {
+			c.update(func(s *WorkerStatus) {
+				s.ActiveGeneration = snapshot.ActiveGeneration
+				s.InFlight = snapshot.WorkerInFlight
+				s.Leases = snapshot.WorkerLeases
+				s.DrainZeroSince = snapshot.DrainZeroSince
+			})
+		}
+		if err != nil || snapshot.ActiveGeneration != c.generation || snapshot.WorkerOwner != c.owner ||
+			!snapshot.ClaimsEnabled || snapshot.DrainRequested {
+			c.update(func(s *WorkerStatus) {
+				s.State = WorkerDraining
+				s.AcceptingNew = false
+				if err != nil {
+					s.LastError = err.Error()
+				}
+			})
+			cancel()
+			workerErr := <-done
+			c.update(func(s *WorkerStatus) { s.State = WorkerDrained; s.AcceptingNew = false })
+			if err != nil {
+				return err
+			}
+			if snapshot.ActiveGeneration != c.generation {
+				c.update(func(s *WorkerStatus) { s.State = WorkerFenced })
+				return ErrGenerationMismatch
+			}
+			return workerErr
 		}
 		if err := c.store.Heartbeat(ctx, c.generation, c.owner); err != nil {
 			c.update(func(s *WorkerStatus) { s.State = WorkerDraining; s.AcceptingNew = false; s.LastError = err.Error() })

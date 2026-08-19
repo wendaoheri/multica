@@ -9,6 +9,9 @@ x-backend: &backend
     REDIS_URL: ${REDIS_URL:?set REDIS_URL}
     MULTICA_AUTO_MIGRATE: "false"
     REALTIME_RELAY_MODE: sharded
+    REALTIME_RELAY_MAX_CONSUMER_LAG: ${REALTIME_RELAY_MAX_CONSUMER_LAG:-30s}
+    REALTIME_RELAY_CONSUMER_FAILURE_LIMIT: ${REALTIME_RELAY_CONSUMER_FAILURE_LIMIT:-3}
+    REALTIME_RELAY_CONSUMER_RECOVERY_LIMIT: ${REALTIME_RELAY_CONSUMER_RECOVERY_LIMIT:-2}
   volumes:
     - uploads:/app/data/uploads
   networks:
@@ -101,6 +104,7 @@ services:
         ./releasectl verify-manifest
         --manifest /release/manifest.json
         --artifact-dir /release
+        --require-combination ${TARGET_COMBINATION:?set TARGET_COMBINATION}
         --migration-dir /app/migrations
         --check-database
         && timeout 1200 ./migrate up

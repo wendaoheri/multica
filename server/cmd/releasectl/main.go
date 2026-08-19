@@ -82,6 +82,19 @@ func main() {
 			fatal(err)
 		}
 		printJSON(map[string]any{"generation": *generation, "claims_enabled": false})
+	case "complete-drain":
+		fs := flag.NewFlagSet("complete-drain", flag.ExitOnError)
+		generation := fs.Int64("generation", 0, "expected active generation")
+		owner := fs.String("owner", "", "worker owner id")
+		window := fs.Duration("observation-window", deployment.DrainObservationWindow, "continuous zero-activity observation window")
+		_ = fs.Parse(os.Args[2:])
+		if *generation <= 0 || *owner == "" {
+			fatal(errors.New("--generation and --owner are required"))
+		}
+		if err := store.CompleteDrain(context.Background(), *generation, *owner, *window); err != nil {
+			fatal(err)
+		}
+		printJSON(map[string]any{"generation": *generation, "owner": *owner, "status": "drained_owner_released"})
 	default:
 		usage()
 	}
@@ -103,6 +116,7 @@ func verifyManifest(args []string) {
 	artifactDir := fs.String("artifact-dir", "", "immutable smoke artifact directory")
 	migrationDir := fs.String("migration-dir", "", "migrator artifact migration directory")
 	checkDatabase := fs.Bool("check-database", false, "compare applied/pending state with schema_migrations")
+	requireCombination := fs.String("require-combination", "", "require this exact W/K/S target to be ALLOW")
 	_ = fs.Parse(args)
 	if *manifestPath == "" {
 		fatal(errors.New("--manifest is required"))
@@ -114,7 +128,11 @@ func verifyManifest(args []string) {
 	if err != nil {
 		fatal(err)
 	}
-	if err := releasecompat.Validate(manifest, *artifactDir); err != nil {
+	if *requireCombination != "" {
+		if err := releasecompat.ValidateTarget(manifest, *artifactDir, *requireCombination); err != nil {
+			fatal(err)
+		}
+	} else if err := releasecompat.Validate(manifest, *artifactDir); err != nil {
 		fatal(err)
 	}
 	if *migrationDir != "" {
@@ -151,7 +169,7 @@ func verifyManifest(args []string) {
 			fatal(err)
 		}
 	}
-	printJSON(map[string]any{"status": "verified", "release_id": manifest.ReleaseID})
+	printJSON(map[string]any{"status": "verified", "release_id": manifest.ReleaseID, "required_combination": *requireCombination})
 }
 
 func generateManifest(args []string) {
@@ -249,6 +267,6 @@ func fatal(err error) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: releasectl <status|advance-generation|admission-open|admission-close|enable-claims|drain|generate-manifest|verify-manifest>")
+	fmt.Fprintln(os.Stderr, "usage: releasectl <status|advance-generation|admission-open|admission-close|enable-claims|drain|complete-drain|generate-manifest|verify-manifest>")
 	os.Exit(2)
 }

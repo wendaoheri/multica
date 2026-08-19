@@ -14,8 +14,9 @@ type stubWakeup struct {
 	calls []struct{ runtimeID, taskID string }
 }
 
-func (s *stubWakeup) NotifyTaskAvailable(runtimeID, taskID string) {
+func (s *stubWakeup) NotifyTaskAvailable(runtimeID, taskID string) error {
 	s.calls = append(s.calls, struct{ runtimeID, taskID string }{runtimeID, taskID})
+	return nil
 }
 
 // TestNotifyTaskAvailable_BumpsBeforeWakeup pins the contract noted in

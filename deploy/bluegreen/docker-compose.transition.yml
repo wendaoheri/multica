@@ -1,0 +1,150 @@
+name: multica-transition
+
+x-backend: &backend
+  restart: unless-stopped
+  env_file:
+    - ${RELEASE_CONFIG_FILE:?set RELEASE_CONFIG_FILE}
+  environment: &backend-env
+    MULTICA_AUTO_MIGRATE: "false"
+    MULTICA_FEATURE_FLAGS_FILE: /run/multica-release/feature-flags.yaml
+  volumes: &backend-volumes
+    - uploads:/app/data/uploads
+    - ${RELEASE_CONFIG_FILE}:/run/multica-release/config.env:ro
+    - ${RELEASE_FEATURE_FLAGS_FILE:?set RELEASE_FEATURE_FLAGS_FILE}:/run/multica-release/feature-flags.yaml:ro
+  networks:
+    - state
+  labels: &release-labels
+    com.multica.release-id: ${RELEASE_ID:?set RELEASE_ID}
+    com.multica.combination: ${TARGET_COMBINATION:?set TARGET_COMBINATION}
+    com.multica.config-checksum: ${RELEASE_CONFIG_CHECKSUM:?set RELEASE_CONFIG_CHECKSUM}
+    com.multica.flags-checksum: ${RELEASE_FLAGS_CHECKSUM:?set RELEASE_FLAGS_CHECKSUM}
+    com.multica.migration-checksum: ${RELEASE_MIGRATION_CHECKSUM:?set RELEASE_MIGRATION_CHECKSUM}
+
+x-frontend: &frontend
+  restart: unless-stopped
+  networks:
+    - state
+  labels: *release-labels
+
+services:
+  blue-web:
+    <<: *backend
+    image: ${BLUE_BACKEND_IMAGE:?pin BLUE_BACKEND_IMAGE by digest}
+    environment:
+      <<: *backend-env
+      MULTICA_PROCESS_ROLE: web
+      PORT: "8080"
+    ports:
+      - "127.0.0.1:${BLUE_WEB_PORT:-8080}:8080"
+
+  blue-worker:
+    <<: *backend
+    image: ${BLUE_BACKEND_IMAGE:?pin BLUE_BACKEND_IMAGE by digest}
+    environment:
+      <<: *backend-env
+      MULTICA_PROCESS_ROLE: worker
+      MULTICA_RELEASE_GENERATION: ${BLUE_GENERATION:?set BLUE_GENERATION}
+      MULTICA_WORKER_OWNER: ${BLUE_WORKER_OWNER:?set BLUE_WORKER_OWNER}
+      MULTICA_WORKER_ADMIN_ADDR: 0.0.0.0:9091
+      MULTICA_WORKER_ADMIN_TOKEN: ${MULTICA_WORKER_ADMIN_TOKEN:?set MULTICA_WORKER_ADMIN_TOKEN}
+    # The container listener is isolated; the only published path is loopback.
+    ports:
+      - "127.0.0.1:${BLUE_WORKER_ADMIN_PORT:-19091}:9091"
+
+  blue-frontend:
+    <<: *frontend
+    image: ${BLUE_WEB_IMAGE:?pin BLUE_WEB_IMAGE by digest}
+    environment:
+      HOSTNAME: 0.0.0.0
+      REMOTE_API_URL: http://blue-web:8080
+    ports:
+      - "127.0.0.1:${BLUE_FRONTEND_PORT:-3000}:3000"
+
+  green-web:
+    <<: *backend
+    image: ${GREEN_BACKEND_IMAGE:?pin GREEN_BACKEND_IMAGE by digest}
+    environment:
+      <<: *backend-env
+      MULTICA_PROCESS_ROLE: web
+      PORT: "8080"
+    ports:
+      - "127.0.0.1:${GREEN_WEB_PORT:-8081}:8080"
+
+  green-worker:
+    <<: *backend
+    image: ${GREEN_BACKEND_IMAGE:?pin GREEN_BACKEND_IMAGE by digest}
+    environment:
+      <<: *backend-env
+      MULTICA_PROCESS_ROLE: worker
+      MULTICA_RELEASE_GENERATION: ${GREEN_GENERATION:?set GREEN_GENERATION}
+      MULTICA_WORKER_OWNER: ${GREEN_WORKER_OWNER:?set GREEN_WORKER_OWNER}
+      MULTICA_WORKER_ADMIN_ADDR: 0.0.0.0:9091
+      MULTICA_WORKER_ADMIN_TOKEN: ${MULTICA_WORKER_ADMIN_TOKEN:?set MULTICA_WORKER_ADMIN_TOKEN}
+    ports:
+      - "127.0.0.1:${GREEN_WORKER_ADMIN_PORT:-19092}:9091"
+
+  green-frontend:
+    <<: *frontend
+    image: ${GREEN_WEB_IMAGE:?pin GREEN_WEB_IMAGE by digest}
+    environment:
+      HOSTNAME: 0.0.0.0
+      REMOTE_API_URL: http://green-web:8080
+    ports:
+      - "127.0.0.1:${GREEN_FRONTEND_PORT:-3001}:3000"
+
+  migrator:
+    <<: *backend
+    profiles: ["migration"]
+    image: ${MIGRATOR_IMAGE:?pin MIGRATOR_IMAGE by digest}
+    restart: "no"
+    environment:
+      <<: *backend-env
+      PGOPTIONS: -c lock_timeout=3s -c statement_timeout=15min
+    volumes:
+      - ${RELEASE_ARTIFACT_DIR:?set RELEASE_ARTIFACT_DIR}:/release:ro
+      - ${RELEASE_EXECUTION_DIR:?set RELEASE_EXECUTION_DIR}:/release-execution
+      - ${RELEASE_CONFIG_FILE}:/run/multica-release/config.env:ro
+      - ${RELEASE_FEATURE_FLAGS_FILE}:/run/multica-release/feature-flags.yaml:ro
+    entrypoint: ["/bin/sh", "-ec"]
+    # The mktemp nonce is private to this one-shot; completion never infers it
+    # from the host-mounted shared current-attempt record.
+    command:
+      - >-
+        attempt_file=$$(mktemp)
+        && trap 'rm -f "$$attempt_file"' EXIT
+        && ./releasectl begin-migrator-attempt
+        --manifest /release/manifest.json
+        --artifact-dir /release
+        --combination ${TARGET_COMBINATION:?set TARGET_COMBINATION}
+        --deployment-identity /release/deployment.actual.json
+        --config-file /run/multica-release/config.env
+        --feature-flags-file /run/multica-release/feature-flags.yaml
+        --attempt-id-file "$$attempt_file"
+        --output /release-execution/current-attempt.json
+        && ./releasectl verify-manifest
+        --manifest /release/manifest.json
+        --artifact-dir /release
+        --require-combination ${TARGET_COMBINATION}
+        --migration-dir /app/migrations
+        --check-database
+        && timeout 1200 ./migrate up
+        && ./releasectl record-migrator-execution
+        --manifest /release/manifest.json
+        --artifact-dir /release
+        --combination ${TARGET_COMBINATION}
+        --deployment-identity /release/deployment.actual.json
+        --config-file /run/multica-release/config.env
+        --feature-flags-file /run/multica-release/feature-flags.yaml
+        --current-attempt /release-execution/current-attempt.json
+        --expected-attempt-id "$$(cat "$$attempt_file")"
+        --output /release-execution/migrator-execution.json
+
+volumes:
+  uploads:
+    external: true
+    name: ${MULTICA_UPLOADS_VOLUME:?set MULTICA_UPLOADS_VOLUME}
+
+networks:
+  state:
+    external: true
+    name: ${MULTICA_STATE_NETWORK:?set MULTICA_STATE_NETWORK}

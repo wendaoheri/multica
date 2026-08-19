@@ -13,8 +13,9 @@ type terminalWakeupRecorder struct {
 	calls []struct{ runtimeID, taskID string }
 }
 
-func (r *terminalWakeupRecorder) NotifyTaskAvailable(runtimeID, taskID string) {
+func (r *terminalWakeupRecorder) NotifyTaskAvailable(runtimeID, taskID string) error {
 	r.calls = append(r.calls, struct{ runtimeID, taskID string }{runtimeID, taskID})
+	return nil
 }
 
 func failTaskViaHandler(t *testing.T, taskID string) *httptest.ResponseRecorder {

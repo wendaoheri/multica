@@ -111,6 +111,10 @@ type runtimeGCTxStarter interface {
 // When liveness is unavailable or errors, we fall back to trusting the DB
 // stale window — that is the original behavior.
 func runRuntimeSweeper(ctx context.Context, txStarter runtimeGCTxStarter, queries *db.Queries, liveness handler.LivenessStore, taskSvc *service.TaskService, bus *events.Bus) {
+	runRuntimeSweeperGuarded(ctx, txStarter, queries, liveness, taskSvc, bus, nil)
+}
+
+func runRuntimeSweeperGuarded(ctx context.Context, txStarter runtimeGCTxStarter, queries *db.Queries, liveness handler.LivenessStore, taskSvc *service.TaskService, bus *events.Bus, guard func(context.Context, string, bool, func(context.Context) error) error) {
 	ticker := time.NewTicker(sweepInterval)
 	defer ticker.Stop()
 
@@ -119,11 +123,19 @@ func runRuntimeSweeper(ctx context.Context, txStarter runtimeGCTxStarter, querie
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			sweepStaleRuntimes(ctx, queries, liveness, taskSvc, bus)
-			sweepStaleTasks(ctx, queries, taskSvc, bus)
-			sweepExpiredQueuedTasks(ctx, queries, taskSvc)
-			sweepDeferredChatFinalizations(ctx, queries, taskSvc)
-			gcRuntimes(ctx, txStarter, queries, taskSvc.Metrics, bus)
+			run := func(opctx context.Context) error {
+				sweepStaleRuntimes(opctx, queries, liveness, taskSvc, bus)
+				sweepStaleTasks(opctx, queries, taskSvc, bus)
+				sweepExpiredQueuedTasks(opctx, queries, taskSvc)
+				sweepDeferredChatFinalizations(opctx, queries, taskSvc)
+				gcRuntimes(opctx, txStarter, queries, taskSvc.Metrics, bus)
+				return nil
+			}
+			if guard != nil {
+				_ = guard(ctx, "runtime-sweeper-cycle", true, run)
+			} else {
+				_ = run(ctx)
+			}
 		}
 	}
 }

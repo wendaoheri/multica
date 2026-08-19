@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,7 +38,10 @@ type ShardedStreamRelayConfig struct {
 	// consuming from (now - ReplayGrace) rather than "$" so that any events
 	// published while this pod was down are replayed. Events are bounded by
 	// the stream's MAXLEN, and downstream consumers must be idempotent.
-	ReplayGrace time.Duration
+	ReplayGrace           time.Duration
+	MaxConsumerLag        time.Duration
+	ConsumerFailureLimit  int
+	ConsumerRecoveryLimit int
 }
 
 // DefaultShardedStreamRelayConfig returns production-safe defaults: a small
@@ -44,11 +49,14 @@ type ShardedStreamRelayConfig struct {
 // batched reads.
 func DefaultShardedStreamRelayConfig() ShardedStreamRelayConfig {
 	return ShardedStreamRelayConfig{
-		Shards:       defaultShardedRelayShards,
-		StreamMaxLen: defaultShardedRelayStreamMaxLen,
-		ReadCount:    defaultShardedRelayReadCount,
-		ReadBlock:    defaultShardedRelayReadBlock,
-		ReplayGrace:  defaultShardedRelayReplayGrace,
+		Shards:                defaultShardedRelayShards,
+		StreamMaxLen:          defaultShardedRelayStreamMaxLen,
+		ReadCount:             defaultShardedRelayReadCount,
+		ReadBlock:             defaultShardedRelayReadBlock,
+		ReplayGrace:           defaultShardedRelayReplayGrace,
+		MaxConsumerLag:        defaultRelayMaxConsumerLag,
+		ConsumerFailureLimit:  defaultRelayFailureLimit,
+		ConsumerRecoveryLimit: defaultRelayRecoveryLimit,
 	}
 }
 
@@ -69,6 +77,15 @@ func (c ShardedStreamRelayConfig) withDefaults() ShardedStreamRelayConfig {
 	if c.ReplayGrace <= 0 {
 		c.ReplayGrace = def.ReplayGrace
 	}
+	if c.MaxConsumerLag <= 0 {
+		c.MaxConsumerLag = def.MaxConsumerLag
+	}
+	if c.ConsumerFailureLimit <= 0 {
+		c.ConsumerFailureLimit = def.ConsumerFailureLimit
+	}
+	if c.ConsumerRecoveryLimit <= 0 {
+		c.ConsumerRecoveryLimit = def.ConsumerRecoveryLimit
+	}
 	return c
 }
 
@@ -82,6 +99,7 @@ type ShardedStreamRelay struct {
 	readRDB  *redis.Client
 	nodeID   string
 	config   ShardedStreamRelayConfig
+	health   *RelayHealthTracker
 
 	mu       sync.Mutex
 	stopping bool
@@ -94,12 +112,15 @@ func NewShardedStreamRelay(hub *Hub, writeRDB, readRDB *redis.Client, config Sha
 	if readRDB == nil {
 		readRDB = writeRDB
 	}
+	config = config.withDefaults()
 	return &ShardedStreamRelay{
 		hub:      hub,
 		writeRDB: writeRDB,
 		readRDB:  readRDB,
 		nodeID:   ulid.Make().String(),
-		config:   config.withDefaults(),
+		config:   config,
+		health: NewRelayHealthTracker(config.Shards, config.MaxConsumerLag,
+			config.ConsumerFailureLimit, config.ConsumerRecoveryLimit),
 	}
 }
 
@@ -115,17 +136,20 @@ func (r *ShardedStreamRelay) Start(ctx context.Context) {
 		slog.Error("realtime/sharded-redis: initial ping failed", "error", err)
 		M.RedisConnected.Store(false)
 		M.SetRedisLastError(err.Error())
+		r.health.MarkWrite(err)
 	} else if r.readRDB != r.writeRDB {
 		if err := r.readRDB.Ping(ctx).Err(); err != nil {
 			slog.Error("realtime/sharded-redis: initial read-client ping failed", "error", err)
 			M.RedisConnected.Store(false)
 			M.SetRedisLastError(err.Error())
+			r.health.MarkHeartbeat(err)
 		} else {
-			M.RedisConnected.Store(true)
+			r.health.MarkStartupReady()
 		}
 	} else {
-		M.RedisConnected.Store(true)
+		r.health.MarkStartupReady()
 	}
+	r.refreshHealthMetrics()
 
 	r.wg.Add(1 + r.config.Shards)
 	go func() {
@@ -186,10 +210,14 @@ func (r *ShardedStreamRelay) PublishWithID(scopeType, scopeID, exclude string, f
 	defer cancel()
 	if err := r.writeRDB.XAdd(ctx, args).Err(); err != nil {
 		M.RedisXAddErrors.Add(1)
+		r.health.MarkWrite(err)
+		r.refreshHealthMetrics()
 		M.SetRedisLastError(err.Error())
 		slog.Warn("realtime/sharded-redis: XADD failed", "error", err, "scope", scopeType, "scope_id", scopeID, "stream", stream)
 		return err
 	}
+	r.health.MarkWrite(nil)
+	r.refreshHealthMetrics()
 	M.RedisXAddTotal.Add(1)
 	M.RedisLastXAddLagMicros.Store(time.Since(start).Microseconds())
 	return nil
@@ -244,12 +272,19 @@ func (r *ShardedStreamRelay) readShardOnce(ctx context.Context, shard int, strea
 	}).Result()
 	cancel()
 
-	if errors.Is(err, redis.Nil) || (err != nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled))) {
+	if errors.Is(err, redis.Nil) {
+		r.health.MarkConsumer(shard, 0, nil)
+		r.refreshHealthMetrics()
 		return true
+	}
+	if errors.Is(err, context.Canceled) && ctx.Err() != nil {
+		return false
 	}
 	if err != nil {
 		M.RedisXReadErrors.Add(1)
 		M.SetRedisLastError(err.Error())
+		r.health.MarkConsumer(shard, 0, err)
+		r.refreshHealthMetrics()
 		slog.Warn("realtime/sharded-redis: XREAD failed", "error", err, "shard", shard, "stream", stream)
 		select {
 		case <-ctx.Done():
@@ -259,14 +294,33 @@ func (r *ShardedStreamRelay) readShardOnce(ctx context.Context, shard int, strea
 		return true
 	}
 
+	var maxLag time.Duration
 	for _, s := range res {
 		for _, msg := range s.Messages {
 			*lastID = msg.ID
 			M.RedisXReadTotal.Add(1)
 			r.deliverMessage(msg)
+			if lag := streamMessageLag(msg.ID); lag > maxLag {
+				maxLag = lag
+			}
 		}
 	}
+	r.health.MarkConsumer(shard, maxLag, nil)
+	r.refreshHealthMetrics()
 	return true
+}
+
+func streamMessageLag(id string) time.Duration {
+	parts := strings.SplitN(id, "-", 2)
+	millis, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0
+	}
+	lag := time.Since(time.UnixMilli(millis))
+	if lag < 0 {
+		return 0
+	}
+	return lag
 }
 
 func (r *ShardedStreamRelay) deliverMessage(msg redis.XMessage) {
@@ -294,11 +348,27 @@ func (r *ShardedStreamRelay) heartbeatOnce(ctx context.Context) {
 	hbCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	if err := r.writeRDB.Set(hbCtx, HeartbeatKey(r.nodeID), time.Now().UTC().Format(time.RFC3339Nano), heartbeatTTL).Err(); err != nil {
-		M.RedisConnected.Store(false)
+		r.health.MarkHeartbeat(err)
+		r.refreshHealthMetrics()
 		M.SetRedisLastError(err.Error())
 		return
 	}
-	M.RedisConnected.Store(true)
+	r.health.MarkHeartbeat(nil)
+	r.refreshHealthMetrics()
+}
+
+// Health reports the aggregate runtime relay state. Publisher and heartbeat
+// success cannot mask a failed or lagging consumer shard.
+func (r *ShardedStreamRelay) Health(context.Context) error {
+	return r.health.Health()
+}
+
+func (r *ShardedStreamRelay) refreshHealthMetrics() {
+	err := r.health.Health()
+	M.RedisConnected.Store(err == nil)
+	if err != nil {
+		M.SetRedisLastError(err.Error())
+	}
 }
 
 func (r *ShardedStreamRelay) isStopping() bool {

@@ -36,6 +36,15 @@ type fakeStore struct {
 	releaseObservedCtxErr error
 }
 
+func TestSupervisorLeaseRenewChecksGenerationFenceBeforeStore(t *testing.T) {
+	want := errors.New("old generation")
+	s := &Supervisor{cfg: Config{Now: time.Now}, operationGuard: func(context.Context, string, bool, func(context.Context) error) error { return want }}
+	ok, err := s.acquireLease(context.Background(), pgtype.UUID{}, "token")
+	if ok || !errors.Is(err, want) {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+}
+
 func newFakeStore() *fakeStore {
 	return &fakeStore{
 		leaseOwner:     make(map[string]string),

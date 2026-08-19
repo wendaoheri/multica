@@ -1,0 +1,4 @@
+{
+  "319_deployment_release_control.up.sql": "expand",
+  "320_deployment_release_control_singleton_index.up.sql": "expand"
+}

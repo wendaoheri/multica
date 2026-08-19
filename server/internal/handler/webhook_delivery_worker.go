@@ -25,9 +25,14 @@ const (
 // lease both live in Postgres, so a process restart or replica failover simply
 // reclaims expired rows; the in-memory notification is only a latency hint.
 type WebhookDeliveryWorker struct {
-	h      *Handler
-	notify chan struct{}
-	done   chan struct{}
+	h              *Handler
+	notify         chan struct{}
+	done           chan struct{}
+	operationGuard func(context.Context, string, bool, func(context.Context) error) error
+}
+
+func (w *WebhookDeliveryWorker) SetOperationGuard(guard func(context.Context, string, bool, func(context.Context) error) error) {
+	w.operationGuard = guard
 }
 
 func NewWebhookDeliveryWorker(h *Handler) *WebhookDeliveryWorker {
@@ -110,6 +115,19 @@ func (w *WebhookDeliveryWorker) WaitWithTimeout(timeout time.Duration) bool {
 }
 
 func (w *WebhookDeliveryWorker) ProcessNext(ctx context.Context) (bool, error) {
+	if w.operationGuard != nil {
+		var worked bool
+		err := w.operationGuard(ctx, "webhook-delivery-claim", true, func(runCtx context.Context) error {
+			var innerErr error
+			worked, innerErr = w.processNext(runCtx)
+			return innerErr
+		})
+		return worked, err
+	}
+	return w.processNext(ctx)
+}
+
+func (w *WebhookDeliveryWorker) processNext(ctx context.Context) (bool, error) {
 	delivery, err := w.h.Queries.ClaimQueuedWebhookDelivery(ctx)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil

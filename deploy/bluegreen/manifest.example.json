@@ -1,0 +1,25 @@
+{
+  "release_id": "PER-376-example",
+  "from_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+  "web_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+  "worker_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+  "config_checksum": "0000000000000000000000000000000000000000000000000000000000000000",
+  "feature_flags_checksum": "0000000000000000000000000000000000000000000000000000000000000000",
+  "migration_manifest_checksum": "0000000000000000000000000000000000000000000000000000000000000000",
+  "migrations": [],
+  "combinations": {
+    "W0K0S0": {"decision": "DENY"},
+    "W0K0S1": {"decision": "DENY"},
+    "W0K0S2": {"decision": "DENY"},
+    "W0K1S0": {"decision": "DENY"},
+    "W0K1S1": {"decision": "DENY"},
+    "W0K1S2": {"decision": "DENY"},
+    "W1K0S0": {"decision": "DENY"},
+    "W1K0S1": {"decision": "DENY"},
+    "W1K0S2": {"decision": "DENY"},
+    "W1K1S0": {"decision": "DENY"},
+    "W1K1S1": {"decision": "DENY"},
+    "W1K1S2": {"decision": "DENY"}
+  },
+  "rollback_script_checksum": "0000000000000000000000000000000000000000000000000000000000000000"
+}

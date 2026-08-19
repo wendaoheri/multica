@@ -4,7 +4,7 @@ root=$(CDPATH= cd -- "$(dirname "$0")" && pwd); work=$(mktemp -d); trap 'rm -rf 
 mkdir "$work/bin" "$work/artifacts"; : >"$work/body.json"
 d=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 cat >"$work/artifacts/manifest.json" <<EOF
-{"release_id":"r1","migration_manifest_checksum":"$d","combinations":{"W1K1S1":{"deployment":{"web_image":"r/web@sha256:$d","worker_image":"r/worker@sha256:$d","frontend_image":"r/front@sha256:$d","migrator_image":"r/migrate@sha256:$d","config_checksum":"$d","feature_flags_checksum":"$d","migration_manifest_checksum":"$d"}}}}
+{"release_id":"r1","config_checksum":"$d","feature_flags_checksum":"$d","migration_manifest_checksum":"$d","combinations":{"W1K1S1":{"deployment":{"web_image":"r/web@sha256:$d","worker_image":"r/worker@sha256:$d","frontend_image":"r/front@sha256:$d","migrator_image":"r/migrate@sha256:$d","config_checksum":"$d","feature_flags_checksum":"$d","migration_manifest_checksum":"$d"}}}}
 EOF
 cat >"$work/runtime.good.json" <<EOF
 {"release_id":"r1","combination":"W1K1S1","migration_manifest_checksum":"$d","deployment":{"web_image":"r/web@sha256:$d","worker_image":"r/worker@sha256:$d","frontend_image":"r/front@sha256:$d","migrator_image":"r/migrate@sha256:$d","config_checksum":"$d","feature_flags_checksum":"$d","migration_manifest_checksum":"$d"}}
@@ -17,7 +17,23 @@ cat >"$work/bin/curl" <<'EOF'
 #!/bin/sh
 case "$*" in *'/readyz'*) printf '{"ready":true}\n' ;; *'/status'*) printf '{"control":{"active_generation":2,"claims_enabled":false,"admission_open":false}}\n' ;; *'write-out'*) printf '200' ;; *) printf '200' ;; esac
 EOF
+cat >"$work/bin/docker" <<'EOF'
+#!/bin/sh
+d=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+if [ "$1" = compose ]; then for arg in "$@"; do service=$arg; done; printf '%s\n' "$service"; exit 0; fi
+container=$2
+case "$*" in
+  *RepoDigests*) case "$container" in green-web) image=r/web ;; green-worker) image=r/worker ;; green-frontend) image=r/front ;; migrator) image=r/migrate ;; *) exit 1 ;; esac; printf '["%s@sha256:%s"]\n' "$image" "$d" ;;
+  *release-id*) printf 'r1\n' ;; *combination*) printf 'W1K1S1\n' ;;
+  *config-checksum*|*flags-checksum*|*migration-checksum*) printf '%s\n' "$d" ;;
+  *) exit 1 ;;
+esac
+EOF
 chmod +x "$work/bin/"*
+PATH="$work/bin:$PATH" COMBINATION=W1K1S1 COMPOSE_FILE="$work/compose.yml" \
+  RELEASE_MANIFEST="$work/artifacts/manifest.json" RUNTIME_IDENTITY_REPORT="$work/runtime.collected.json" \
+  "$root/runtime_identity.sh"
+jq -e --slurpfile expected "$work/runtime.good.json" '. == $expected[0]' "$work/runtime.collected.json" >/dev/null
 run() {
   PATH="$work/bin:$PATH" COMBINATION=W1K1S1 WEB_URL=http://127.0.0.1:1 FRONTEND_URL=http://127.0.0.1:2 \
   WORKER_ADMIN_URL=http://127.0.0.1:3 CRITICAL_WRITE_URL=http://127.0.0.1:4 MULTICA_WORKER_ADMIN_TOKEN=x \

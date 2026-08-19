@@ -22,7 +22,9 @@ independent reviewer approves this implementation and a separate S3 Go/No-Go.
   `complete-drain` releases it. Every background write/renewal acquires the
   current generation/owner fence; an old generation never becomes valid again.
 - Unknown `W/K/S` combinations are `DENY`. `ALLOW` requires an immutable smoke
-  report whose checksum matches the release manifest.
+  report and deployment identity. Release validation parses the real expanded
+  Compose input, requires every image to use `@sha256`, and compares selected
+  images plus checksums of the actual config/flags files with that identity.
 
 ## Build artifacts
 
@@ -72,9 +74,10 @@ automatically run `migrate down`.
    for 60 seconds, complete drain, advance generation, and bind K1.
 5. Validate a complete config using the candidate fragment while the live
    fragment is untouched. Only then atomically install, validate, and reload.
-6. Run the target ALLOW smoke (ten readiness successes and isolated critical
-   write), open admission, and only afterward enable claims. Any failure closes
-   both gates.
+6. Run the target ALLOW smoke (ten readiness successes, running-container
+   RepoDigest/release/config/flags/migration identity, and isolated critical
+   write), then atomically activate admission and claims in one DB transition.
+   A rejected activation leaves both gates closed.
 7. Read old-Web WS counts directly from its loopback endpoint. Drain for up to
    five minutes and observe both versions for at least 60 minutes.
 
@@ -83,14 +86,17 @@ automatically run `migrate down`.
 Run `release.sh rollback-blue --execute` only in an approved window. Its order
 is fixed: close admission → drain green worker → verify drained → advance the
 generation fence → start blue worker claims-disabled → validate/reload the blue
-Caddy fragment → run `SMOKE-W0K0S1/S2` → enable blue claims → reopen admission.
-Any uncertain query keeps admission and claims closed for manual handling.
+Caddy fragment → run `SMOKE-W0K0S1/S2` → atomically activate both gates.
+There is no open/enable intermediate state or weaker manual fallback.
 
 ## Observation and automatic action
 
 Collect the preceding 15-minute baseline (at least 500 requests; otherwise use
 documented absolute/synthetic checks), then run `observe.sh` on every window
-for at least 60 minutes. Exit 20 means automatic rollback, 10 stops progress:
+continuously for at least 60 minutes. `OBSERVATION_COMMAND` is mandatory;
+missing samples, command failure, or rollback signals fail immediately. A
+short window exists only behind the explicit test-only switch. Exit 20 means
+automatic rollback, 10 stops progress:
 
 - rollback for auth/write/queue/WS smoke failure, duplicate claim/run, relay
   unhealthy, panic/OOM/restart, or data discrepancy;

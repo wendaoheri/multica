@@ -136,6 +136,36 @@ func (s *ControlStore) EnableClaims(ctx context.Context, generation int64, owner
 	return ErrWorkerOwned
 }
 
+// Activate atomically opens admission and claims for exactly one generation
+// and owner. There is no externally visible half-open state.
+func (s *ControlStore) Activate(ctx context.Context, generation int64, owner string) error {
+	if owner == "" {
+		return fmt.Errorf("worker owner is required")
+	}
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE deployment_release_control
+		SET admission_open = TRUE,
+		    claims_enabled = TRUE,
+		    worker_owner = $2,
+		    worker_heartbeat_at = NOW(),
+		    updated_at = NOW()
+		WHERE singleton = TRUE
+		  AND active_generation = $1
+		  AND admission_open = FALSE
+		  AND claims_enabled = FALSE
+		  AND drain_requested = FALSE
+		  AND worker_in_flight = 0
+		  AND worker_leases = 0
+		  AND (worker_owner IS NULL OR worker_owner = $2)`, generation, owner)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrWorkerOwned
+	}
+	return nil
+}
+
 // Drain closes claims but deliberately retains owner. A replacement cannot be
 // enabled until the old process has stopped all fenced operations and leases,
 // reported zero continuously, and CompleteDrain releases ownership.

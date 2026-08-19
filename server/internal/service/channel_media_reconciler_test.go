@@ -26,6 +26,21 @@ type fakeObjectDeleter struct {
 	onDelete func(key string)
 }
 
+func TestChannelMediaRunOnceChecksFenceBeforeClaim(t *testing.T) {
+	called := false
+	r := &ChannelMediaReconciler{OperationGuard: func(_ context.Context, kind string, lease bool, _ func(context.Context) error) error {
+		called = true
+		if kind != "channel-media-reconcile" || !lease {
+			t.Fatalf("guard kind=%q lease=%v", kind, lease)
+		}
+		return errors.New("old generation")
+	}}
+	r.RunOnce(context.Background())
+	if !called {
+		t.Fatal("operation fence was not checked")
+	}
+}
+
 func (f *fakeObjectDeleter) DeleteObject(_ context.Context, key string) error {
 	f.mu.Lock()
 	hook := f.onDelete

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -33,8 +34,11 @@ func runBackgroundComposition(
 	compositionCtx, cancelComposition := context.WithCancel(ctx)
 	defer cancelComposition()
 	componentErr := make(chan error, 8)
+	var components sync.WaitGroup
 	goComponent := func(kind string, lease bool, run func(context.Context) error) {
+		components.Add(1)
 		go func() {
+			defer components.Done()
 			var err error
 			if fence != nil {
 				err = fence.RunFenced(compositionCtx, kind, lease, run)
@@ -50,11 +54,19 @@ func runBackgroundComposition(
 		}()
 	}
 	goComponent("runtime-sweeper", false, func(runCtx context.Context) error {
-		runRuntimeSweeper(runCtx, pool, queries, liveness, taskSvc, bus)
+		var guard func(context.Context, string, bool, func(context.Context) error) error
+		if fence != nil {
+			guard = fence.RunFenced
+		}
+		runRuntimeSweeperGuarded(runCtx, pool, queries, liveness, taskSvc, bus, guard)
 		return runCtx.Err()
 	})
 	goComponent("autopilot-failure-monitor", false, func(runCtx context.Context) error {
-		runAutopilotFailureMonitor(runCtx, queries, bus, envFailureMonitorConfig())
+		var guard func(context.Context, string, bool, func(context.Context) error) error
+		if fence != nil {
+			guard = fence.RunFenced
+		}
+		runAutopilotFailureMonitorGuarded(runCtx, queries, bus, envFailureMonitorConfig(), guard)
 		return runCtx.Err()
 	})
 	goComponent("db-stats", false, func(runCtx context.Context) error {
@@ -62,31 +74,59 @@ func runBackgroundComposition(
 		return runCtx.Err()
 	})
 	if h.WebhookDeliveryWorker != nil {
+		if fence != nil {
+			h.WebhookDeliveryWorker.SetOperationGuard(func(c context.Context, k string, l bool, fn func(context.Context) error) error {
+				return fence.RunFenced(c, k, l, fn)
+			})
+		}
 		goComponent("webhook-delivery", true, func(runCtx context.Context) error {
 			h.WebhookDeliveryWorker.Run(runCtx)
 			return runCtx.Err()
 		})
 	}
 	goComponent("pr-refresh", true, func(runCtx context.Context) error {
+		if fence != nil {
+			h.PRRefresh.SetOperationGuard(func(c context.Context, k string, l bool, fn func(context.Context) error) error {
+				return fence.RunFenced(c, k, l, fn)
+			})
+		}
 		h.PRRefresh.Start(runCtx)
 		<-runCtx.Done()
+		h.PRRefresh.Wait()
 		return runCtx.Err()
 	})
 	if h.ChannelSupervisor != nil {
+		if fence != nil {
+			h.ChannelSupervisor.SetOperationGuard(func(c context.Context, k string, l bool, fn func(context.Context) error) error {
+				return fence.RunFenced(c, k, l, fn)
+			})
+		}
 		goComponent("channel-supervisor", true, func(runCtx context.Context) error {
 			h.ChannelSupervisor.Run(runCtx)
+			h.ChannelSupervisor.Wait()
 			return runCtx.Err()
 		})
 	}
 	if h.ChannelMediaReconciler != nil {
 		h.ChannelMediaReconciler.Metrics = channelMediaMetrics
+		if fence != nil {
+			h.ChannelMediaReconciler.OperationGuard = func(c context.Context, k string, l bool, fn func(context.Context) error) error {
+				return fence.RunFenced(c, k, l, fn)
+			}
+		}
 		goComponent("channel-media", true, func(runCtx context.Context) error {
 			h.ChannelMediaReconciler.Run(runCtx)
 			return runCtx.Err()
 		})
 	}
 
-	schedulerMgr := scheduler.NewManager(pool, scheduler.Options{})
+	schedulerOpts := scheduler.Options{}
+	if fence != nil {
+		schedulerOpts.OperationGuard = func(c context.Context, k string, l bool, fn func(context.Context) error) error {
+			return fence.RunFenced(c, k, l, fn)
+		}
+	}
+	schedulerMgr := scheduler.NewManager(pool, schedulerOpts)
 	if err := schedulerMgr.Register(scheduler.TaskUsageHourlyJob(pool)); err != nil {
 		return err
 	}
@@ -99,8 +139,11 @@ func runBackgroundComposition(
 	case <-ctx.Done():
 	case err := <-componentErr:
 		cancelComposition()
+		components.Wait()
 		return err
 	}
+	cancelComposition()
+	components.Wait()
 	if h.WebhookDeliveryWorker != nil && !h.WebhookDeliveryWorker.WaitWithTimeout(5*time.Second) {
 		slog.Warn("webhook delivery worker did not exit within drain timeout")
 	}

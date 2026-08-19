@@ -26,6 +26,24 @@ func main() {
 		generateManifest(os.Args[2:])
 		return
 	}
+	if os.Args[1] == "verify-deployment" {
+		verifyDeployment(os.Args[2:])
+		return
+	}
+	if os.Args[1] == "checksum" {
+		fs := flag.NewFlagSet("checksum", flag.ExitOnError)
+		path := fs.String("file", "", "file to hash")
+		_ = fs.Parse(os.Args[2:])
+		if *path == "" {
+			fatal(errors.New("--file is required"))
+		}
+		sum, err := releasecompat.FileSHA256(*path)
+		if err != nil {
+			fatal(err)
+		}
+		fmt.Println(sum)
+		return
+	}
 
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
@@ -70,6 +88,18 @@ func main() {
 			fatal(err)
 		}
 		printJSON(map[string]any{"generation": *generation, "owner": *owner, "claims_enabled": true})
+	case "activate":
+		fs := flag.NewFlagSet("activate", flag.ExitOnError)
+		generation := fs.Int64("generation", 0, "expected active generation")
+		owner := fs.String("owner", "", "worker instance owner id")
+		_ = fs.Parse(os.Args[2:])
+		if *generation <= 0 || *owner == "" {
+			fatal(errors.New("--generation and --owner are required"))
+		}
+		if err := store.Activate(context.Background(), *generation, *owner); err != nil {
+			fatal(err)
+		}
+		printJSON(map[string]any{"generation": *generation, "owner": *owner, "claims_enabled": true, "admission_open": true})
 	case "drain":
 		fs := flag.NewFlagSet("drain", flag.ExitOnError)
 		generation := fs.Int64("generation", 0, "expected active generation")
@@ -98,6 +128,38 @@ func main() {
 	default:
 		usage()
 	}
+}
+
+func verifyDeployment(args []string) {
+	fs := flag.NewFlagSet("verify-deployment", flag.ExitOnError)
+	manifestPath := fs.String("manifest", "", "release manifest JSON")
+	artifactDir := fs.String("artifact-dir", "", "smoke artifact directory")
+	combination := fs.String("combination", "", "actual W/K/S combination")
+	compose := fs.String("compose-json", "", "actual docker compose config --format json output")
+	config := fs.String("config-file", "", "actual effective config")
+	flags := fs.String("feature-flags-file", "", "actual effective flags")
+	output := fs.String("output", "", "write verified actual identity JSON")
+	_ = fs.Parse(args)
+	if *manifestPath == "" || *combination == "" || *compose == "" || *config == "" || *flags == "" {
+		fatal(errors.New("--manifest, --combination, --compose-json, --config-file, and --feature-flags-file are required"))
+	}
+	if *artifactDir == "" {
+		*artifactDir = filepath.Dir(*manifestPath)
+	}
+	manifest, err := releasecompat.Load(*manifestPath)
+	if err != nil {
+		fatal(err)
+	}
+	id, err := releasecompat.VerifyDeployment(manifest, *artifactDir, *combination, *compose, *config, *flags)
+	if err != nil {
+		fatal(err)
+	}
+	if *output != "" {
+		if err := releasecompat.WriteDeploymentIdentity(*output, id); err != nil {
+			fatal(err)
+		}
+	}
+	printJSON(map[string]any{"status": "verified", "release_id": manifest.ReleaseID, "combination": *combination, "deployment": id})
 }
 
 func requiredGeneration(args []string) int64 {

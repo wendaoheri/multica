@@ -3,15 +3,19 @@ package deployment
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
 type fakeWorkerStore struct {
-	mu       sync.Mutex
-	snapshot ControlSnapshot
-	heartErr error
+	mu           sync.Mutex
+	snapshot     ControlSnapshot
+	heartErr     error
+	drainBlock   <-chan struct{}
+	drainStarted chan struct{}
+	drainErr     error
 }
 
 func (f *fakeWorkerStore) Load(context.Context) (ControlSnapshot, error) {
@@ -26,9 +30,25 @@ func (f *fakeWorkerStore) Heartbeat(context.Context, int64, string) error {
 	return f.heartErr
 }
 
-func (f *fakeWorkerStore) Drain(_ context.Context, generation int64, owner string) error {
+func (f *fakeWorkerStore) Drain(ctx context.Context, generation int64, owner string) error {
+	if f.drainStarted != nil {
+		select {
+		case f.drainStarted <- struct{}{}:
+		default:
+		}
+	}
+	if f.drainBlock != nil {
+		select {
+		case <-f.drainBlock:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.drainErr != nil {
+		return f.drainErr
+	}
 	if f.snapshot.ActiveGeneration != generation || f.snapshot.WorkerOwner != owner {
 		return ErrGenerationMismatch
 	}
@@ -36,6 +56,53 @@ func (f *fakeWorkerStore) Drain(_ context.Context, generation int64, owner strin
 	f.snapshot.AdmissionOpen = false
 	f.snapshot.DrainRequested = true
 	return nil
+}
+
+func TestRelayFailureCancelsLocallyBeforeBoundedDrainPersistence(t *testing.T) {
+	block := make(chan struct{})
+	drainStarted := make(chan struct{}, 1)
+	store := &fakeWorkerStore{snapshot: ControlSnapshot{ActiveGeneration: 12, ClaimsEnabled: true, AdmissionOpen: true, WorkerOwner: "worker-a"}, drainBlock: block, drainStarted: drainStarted}
+	var fail sync.Mutex
+	unhealthy := false
+	c := NewWorkerController(store, 12, "worker-a", func(context.Context) error {
+		fail.Lock()
+		defer fail.Unlock()
+		if unhealthy {
+			return errors.New("relay consume failed")
+		}
+		return nil
+	})
+	c.poll = time.Millisecond
+	c.drainTimeout = 20 * time.Millisecond
+	started := make(chan struct{})
+	cancelled := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Run(context.Background(), func(ctx context.Context) error { close(started); <-ctx.Done(); close(cancelled); return ctx.Err() })
+	}()
+	<-started
+	fail.Lock()
+	unhealthy = true
+	fail.Unlock()
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("composition was not cancelled")
+	}
+	select {
+	case <-drainStarted:
+	case <-time.After(time.Second):
+		t.Fatal("bounded drain was not attempted after cancel")
+	}
+	if err := c.RunFenced(context.Background(), "new-claim", true, func(context.Context) error { t.Fatal("operation ran after local fail-close"); return nil }); err == nil {
+		t.Fatal("new operation accepted during blocked DB drain")
+	}
+	if err := <-done; err == nil {
+		t.Fatal("relay failure hidden")
+	}
+	if !strings.Contains(c.Status().LastError, "deadline exceeded") {
+		t.Fatalf("drain timeout not observable: %+v", c.Status())
+	}
 }
 
 func (f *fakeWorkerStore) acquire(generation int64, owner string, lease bool) error {

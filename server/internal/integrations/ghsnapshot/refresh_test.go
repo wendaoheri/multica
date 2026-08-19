@@ -34,6 +34,54 @@ func TestManagerDisabledNoOps(t *testing.T) {
 	m.Start(context.Background())
 }
 
+func TestManagerWaitJoinsBlockedRefreshBeforeFenceRelease(t *testing.T) {
+	m := NewManager(enabledClient(t), nil, nil, nil)
+	m.concurrency = 1
+	m.sweepInterval = time.Hour
+	m.jitter = func() time.Duration { return 0 }
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	guardReleased := make(chan struct{})
+	m.fetch = func(context.Context, *Client, int64, string, string, int32) (*PRSnapshot, error) {
+		close(entered)
+		<-release
+		return nil, errors.New("blocked fake released")
+	}
+	m.SetOperationGuard(func(ctx context.Context, _ string, _ bool, run func(context.Context) error) error {
+		err := run(ctx)
+		close(guardReleased)
+		return err
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	m.Start(ctx)
+	m.Enqueue(1, "o", "r", 1)
+	<-entered
+	cancel()
+	waited := make(chan struct{})
+	go func() { m.Wait(); close(waited) }()
+	select {
+	case <-waited:
+		t.Fatal("Wait returned while PR child was blocked")
+	case <-time.After(30 * time.Millisecond):
+	}
+	select {
+	case <-guardReleased:
+		t.Fatal("operation lease released before child joined")
+	default:
+	}
+	close(release)
+	select {
+	case <-waited:
+	case <-time.After(time.Second):
+		t.Fatal("Wait did not join released child")
+	}
+	select {
+	case <-guardReleased:
+	case <-time.After(time.Second):
+		t.Fatal("operation fence was not released")
+	}
+}
+
 // TestEnqueueCoalesces proves the dedup / single-in-flight key (acceptance
 // criterion 3): the same PR address enqueued repeatedly is coalesced to one
 // pending item; distinct addresses are not.

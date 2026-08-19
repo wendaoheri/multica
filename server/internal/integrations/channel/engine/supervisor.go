@@ -217,10 +217,11 @@ type Supervisor struct {
 	// supervisorGen is the source of the monotonic gen counter stored on
 	// each entry. Bumped under mu when a new entry is minted (initial start
 	// or rotation restart).
-	supervisorGen uint64
-	wg            sync.WaitGroup
-	stopped       bool
-	stopChan      chan struct{}
+	supervisorGen  uint64
+	wg             sync.WaitGroup
+	stopped        bool
+	stopChan       chan struct{}
+	operationGuard func(context.Context, string, bool, func(context.Context) error) error
 }
 
 // supervisorEntry is the per-installation state the Supervisor holds on
@@ -258,6 +259,12 @@ func NewSupervisor(store InstallationStore, registry *channel.Registry, handler 
 // NodeID exposes the per-process lease token, for tests and observability
 // (so operators can correlate DB lease rows to a running replica).
 func (s *Supervisor) NodeID() string { return s.nodeID }
+
+func (s *Supervisor) SetOperationGuard(guard func(context.Context, string, bool, func(context.Context) error) error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.operationGuard = guard
+}
 
 // Run is the Supervisor's main loop. It scans installations every
 // PollInterval, attempts to lease any not currently supervised by this
@@ -541,11 +548,20 @@ func (s *Supervisor) supervise(ctx context.Context, inst Installation, id string
 // leaseToken), NOT the process-wide nodeID.
 func (s *Supervisor) acquireLease(ctx context.Context, instID pgtype.UUID, token string) (bool, error) {
 	expires := s.cfg.Now().Add(s.cfg.LeaseTTL)
-	err := s.store.AcquireWSLease(ctx, AcquireLeaseParams{
-		ID:        instID,
-		Token:     token,
-		ExpiresAt: expires,
-	})
+	s.mu.Lock()
+	guard := s.operationGuard
+	s.mu.Unlock()
+	acquire := func(runCtx context.Context) error {
+		return s.store.AcquireWSLease(runCtx, AcquireLeaseParams{
+			ID: instID, Token: token, ExpiresAt: expires,
+		})
+	}
+	var err error
+	if guard != nil {
+		err = guard(ctx, "channel-lease-acquire-renew", true, acquire)
+	} else {
+		err = acquire(ctx)
+	}
 	if err == nil {
 		return true, nil
 	}

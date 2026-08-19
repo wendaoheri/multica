@@ -102,10 +102,11 @@ type MediaObjectDeleter interface {
 // deleted from object storage. It runs as an independent worker so
 // object-storage latency spikes cannot starve any other sweeper.
 type ChannelMediaReconciler struct {
-	Queries *db.Queries
-	Storage MediaObjectDeleter
-	Logger  *slog.Logger
-	Metrics *metrics.ChannelMediaReconcilerMetrics
+	Queries        *db.Queries
+	Storage        MediaObjectDeleter
+	Logger         *slog.Logger
+	Metrics        *metrics.ChannelMediaReconcilerMetrics
+	OperationGuard func(context.Context, string, bool, func(context.Context) error) error
 
 	// deleteTimeout is overridable for deterministic tests.
 	deleteTimeout time.Duration
@@ -149,6 +150,17 @@ func (r *ChannelMediaReconciler) Run(ctx context.Context) {
 // off and is retried on a later sweep (or by another replica after lease
 // expiry).
 func (r *ChannelMediaReconciler) RunOnce(ctx context.Context) {
+	if r.OperationGuard != nil {
+		_ = r.OperationGuard(ctx, "channel-media-reconcile", true, func(guarded context.Context) error {
+			r.runOnce(guarded)
+			return nil
+		})
+		return
+	}
+	r.runOnce(ctx)
+}
+
+func (r *ChannelMediaReconciler) runOnce(ctx context.Context) {
 	if r.Storage == nil {
 		// The wiring only builds a reconciler when a storage backend exists,
 		// but a panic here would take down the whole process from a bare

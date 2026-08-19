@@ -61,14 +61,14 @@ func TestValidateAllowRequiresImmutableMatchingReport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m.Combinations["W1K1S1"] = Combination{Decision: DecisionAllow, Report: "smoke.json", ReportSHA256: sum}
+	m.Combinations["W1K1S1"] = allowCombination("smoke.json", sum)
 	if err := Validate(m, dir); err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
 	if err := ValidateTarget(m, dir, "W1K1S1"); err != nil {
 		t.Fatalf("ValidateTarget: %v", err)
 	}
-	m.Combinations["W1K1S1"] = Combination{Decision: DecisionAllow, Report: "smoke.json", ReportSHA256: testDigest}
+	m.Combinations["W1K1S1"] = allowCombination("smoke.json", testDigest)
 	if err := Validate(m, dir); err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
 		t.Fatalf("Validate mismatch error = %v", err)
 	}
@@ -82,7 +82,7 @@ func TestValidateRejectsFreeFormAndMismatchedSmokeReports(t *testing.T) {
 		t.Fatal(err)
 	}
 	sum, _ := fileSHA256(path)
-	m.Combinations["W1K1S1"] = Combination{Decision: DecisionAllow, Report: "smoke.json", ReportSHA256: sum}
+	m.Combinations["W1K1S1"] = allowCombination("smoke.json", sum)
 	if err := Validate(m, dir); err == nil || !strings.Contains(err.Error(), "invalid smoke report structure") {
 		t.Fatalf("free-form report error = %v", err)
 	}
@@ -108,7 +108,7 @@ func TestValidateRejectsFreeFormAndMismatchedSmokeReports(t *testing.T) {
 				t.Fatal(err)
 			}
 			sum, _ = fileSHA256(path)
-			m.Combinations["W1K1S1"] = Combination{Decision: DecisionAllow, Report: "smoke.json", ReportSHA256: sum}
+			m.Combinations["W1K1S1"] = allowCombination("smoke.json", sum)
 			if err := Validate(m, dir); err == nil || !strings.Contains(err.Error(), tc.message) {
 				t.Fatalf("binding error = %v, want %q", err, tc.message)
 			}
@@ -187,4 +187,13 @@ func validSmokeReport(m Manifest, combination string) SmokeReport {
 		StartedAt: time.Unix(1, 0).UTC().Format(time.RFC3339), CompletedAt: time.Unix(2, 0).UTC().Format(time.RFC3339),
 		Checks: checks,
 	}
+}
+
+func allowCombination(report, sum string) Combination {
+	d := strings.Repeat("a", 64)
+	return Combination{Decision: DecisionAllow, Report: report, ReportSHA256: sum, Deployment: &DeploymentIdentity{
+		WebImage: "example/web@sha256:" + d, WorkerImage: "example/worker@sha256:" + d,
+		FrontendImage: "example/frontend@sha256:" + d, MigratorImage: "example/migrator@sha256:" + d,
+		ConfigChecksum: testDigest, FeatureFlagsChecksum: testDigest, MigrationManifestChecksum: testDigest,
+	}}
 }

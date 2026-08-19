@@ -28,6 +28,10 @@ type Options struct {
 	// Logger is used for structured logs. nil defaults to
 	// slog.Default().
 	Logger *slog.Logger
+
+	// OperationGuard fences each claim/run and lease renewal against the
+	// active deployment generation. nil preserves single-process behavior.
+	OperationGuard func(context.Context, string, bool, func(context.Context) error) error
 }
 
 // Manager is the per-process scheduler. Register one or more jobs and
@@ -183,7 +187,17 @@ func (m *Manager) runJob(ctx context.Context, job *JobSpec, now time.Time) error
 			continue
 		}
 		for _, planTime := range plans {
-			m.processPlan(ctx, job, scope, planTime, now)
+			run := func(runCtx context.Context) error {
+				m.processPlan(runCtx, job, scope, planTime, now)
+				return nil
+			}
+			if m.opts.OperationGuard != nil {
+				if err := m.opts.OperationGuard(ctx, "scheduler-occurrence", true, run); err != nil {
+					m.logger.Warn("scheduler occurrence fenced", "job", job.Name, "error", err)
+				}
+			} else {
+				_ = run(ctx)
+			}
 		}
 	}
 	return nil
@@ -448,7 +462,15 @@ func (m *Manager) runHeartbeats(
 			return
 		case <-t.C:
 			hbCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			err := heartbeat(hbCtx, m.pool, c.ID, c.LeaseToken, job.StaleTimeout)
+			heartbeatRun := func(runCtx context.Context) error {
+				return heartbeat(runCtx, m.pool, c.ID, c.LeaseToken, job.StaleTimeout)
+			}
+			var err error
+			if m.opts.OperationGuard != nil {
+				err = m.opts.OperationGuard(hbCtx, "scheduler-lease-renew", true, heartbeatRun)
+			} else {
+				err = heartbeatRun(hbCtx)
+			}
 			cancel()
 			if errors.Is(err, ErrLeaseLost) {
 				log.Warn("scheduler: lease lost during heartbeat, runner should stop")

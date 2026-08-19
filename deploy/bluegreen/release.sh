@@ -19,6 +19,10 @@ case "$mode" in validate|cutover-green|rollback-blue) ;; *) usage ;; esac
 : "${CADDY_BIN:=caddy}"
 : "${RELEASECTL:=releasectl}"
 : "${MULTICA_WORKER_ADMIN_TOKEN:?set MULTICA_WORKER_ADMIN_TOKEN}"
+: "${RELEASE_CONFIG_FILE:?set RELEASE_CONFIG_FILE to the actual effective config}"
+: "${RELEASE_FEATURE_FLAGS_FILE:?set RELEASE_FEATURE_FLAGS_FILE to the actual effective flags}"
+: "${RELEASE_ACTUAL_COMPOSE_FILE:=$RELEASE_ARTIFACT_DIR/compose.actual.json}"
+: "${RELEASE_ACTUAL_IDENTITY_FILE:=$RELEASE_ARTIFACT_DIR/deployment.actual.json}"
 
 case "$CADDY_MANAGED_FRAGMENT" in /*) ;; *) echo "CADDY_MANAGED_FRAGMENT must be absolute" >&2; exit 1 ;; esac
 case "$CADDY_CONFIG" in /*) ;; *) echo "CADDY_CONFIG must be absolute" >&2; exit 1 ;; esac
@@ -28,7 +32,24 @@ verify_artifacts() {
     --manifest "$RELEASE_MANIFEST" \
     --artifact-dir "$RELEASE_ARTIFACT_DIR" \
     --require-combination "$TARGET_COMBINATION"
-  docker compose -f "$COMPOSE_FILE" config --quiet
+  RELEASE_CONFIG_CHECKSUM=$($RELEASECTL checksum --file "$RELEASE_CONFIG_FILE")
+  RELEASE_FLAGS_CHECKSUM=$($RELEASECTL checksum --file "$RELEASE_FEATURE_FLAGS_FILE")
+  RELEASE_MIGRATION_CHECKSUM=$(jq -er .migration_manifest_checksum "$RELEASE_MANIFEST")
+  RELEASE_ID=$(jq -er .release_id "$RELEASE_MANIFEST")
+  export RELEASE_CONFIG_CHECKSUM RELEASE_FLAGS_CHECKSUM RELEASE_MIGRATION_CHECKSUM RELEASE_ID TARGET_COMBINATION
+  [ "$RELEASE_CONFIG_FILE" = "$RELEASE_ARTIFACT_DIR/config.actual" ] || cp "$RELEASE_CONFIG_FILE" "$RELEASE_ARTIFACT_DIR/config.actual"
+  [ "$RELEASE_FEATURE_FLAGS_FILE" = "$RELEASE_ARTIFACT_DIR/flags.actual" ] || cp "$RELEASE_FEATURE_FLAGS_FILE" "$RELEASE_ARTIFACT_DIR/flags.actual"
+  compose_tmp=$(mktemp "${RELEASE_ACTUAL_COMPOSE_FILE}.XXXXXX")
+  if ! docker compose -f "$COMPOSE_FILE" config --format json >"$compose_tmp"; then
+    rm -f "$compose_tmp"
+    return 1
+  fi
+  mv "$compose_tmp" "$RELEASE_ACTUAL_COMPOSE_FILE"
+  "$RELEASECTL" verify-deployment \
+    --manifest "$RELEASE_MANIFEST" --artifact-dir "$RELEASE_ARTIFACT_DIR" \
+    --combination "$TARGET_COMBINATION" --compose-json "$RELEASE_ACTUAL_COMPOSE_FILE" \
+    --config-file "$RELEASE_CONFIG_FILE" --feature-flags-file "$RELEASE_FEATURE_FLAGS_FILE" \
+    --output "$RELEASE_ACTUAL_IDENTITY_FILE"
   "$CADDY_BIN" validate --config "$CADDY_CONFIG"
 }
 
@@ -131,15 +152,8 @@ switch_fragment() {
 
 activate_target() {
   url=$1
-  # Admission opens first. Claims are never enabled if admission/open fails.
-  if ! admin_post "$url" admission/open >/dev/null; then
-    force_closed || true
-    return 1
-  fi
-  if ! admin_post "$url" enable-claims >/dev/null; then
-    force_closed || true
-    return 1
-  fi
+  # One DB transition changes both gates; there is no half-open intermediate.
+  admin_post "$url" activate >/dev/null
 }
 
 rollback_candidate() {
@@ -169,13 +183,27 @@ rollback_candidate() {
 }
 
 observe_or_rollback() {
-  if [ -z "${OBSERVATION_COMMAND:-}" ]; then
-    return 0
-  fi
-  if ! sh -c "$OBSERVATION_COMMAND"; then
-    echo "observation threshold stopped release" >&2
+  : "${OBSERVATION_COMMAND:?set OBSERVATION_COMMAND to the window collector}"
+  : "${OBSERVATION_DURATION_SECONDS:=3600}"
+  : "${OBSERVATION_INTERVAL_SECONDS:=60}"
+  case "$OBSERVATION_DURATION_SECONDS:$OBSERVATION_INTERVAL_SECONDS" in *[!0-9:]*|0:*|*:0) echo "observation durations must be positive integers" >&2; return 1 ;; esac
+  if [ "${MULTICA_RELEASE_TEST_ONLY_SHORT_OBSERVATION:-0}" != 1 ] && [ "$OBSERVATION_DURATION_SECONDS" -lt 3600 ]; then
+    echo "production observation must run continuously for at least 60 minutes" >&2
     return 1
   fi
+  started=$(date +%s)
+  deadline=$((started + OBSERVATION_DURATION_SECONDS))
+  while :; do
+    if ! sh -c "$OBSERVATION_COMMAND"; then
+      echo "observation sample missing, failed, or requested rollback" >&2
+      return 1
+    fi
+    now=$(date +%s)
+    [ "$now" -ge "$deadline" ] && break
+    sleep_for=$OBSERVATION_INTERVAL_SECONDS
+    [ $((now + sleep_for)) -le "$deadline" ] || sleep_for=$((deadline - now))
+    sleep "$sleep_for"
+  done
 }
 
 verify_artifacts

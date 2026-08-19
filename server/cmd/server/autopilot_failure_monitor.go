@@ -70,6 +70,10 @@ func envFailureMonitorConfig() failureMonitorConfig {
 //
 // Disable with `AUTOPILOT_FAIL_MONITOR_INTERVAL=0`.
 func runAutopilotFailureMonitor(ctx context.Context, queries *db.Queries, bus *events.Bus, cfg failureMonitorConfig) {
+	runAutopilotFailureMonitorGuarded(ctx, queries, bus, cfg, nil)
+}
+
+func runAutopilotFailureMonitorGuarded(ctx context.Context, queries *db.Queries, bus *events.Bus, cfg failureMonitorConfig, guard func(context.Context, string, bool, func(context.Context) error) error) {
 	if cfg.Interval <= 0 {
 		slog.Info("autopilot failure monitor: disabled (interval <= 0)")
 		return
@@ -95,7 +99,14 @@ func runAutopilotFailureMonitor(ctx context.Context, queries *db.Queries, bus *e
 
 	// Run once immediately after the startup delay so a freshly-deployed node
 	// catches existing offenders without waiting a full interval.
-	tickAutopilotFailureMonitor(ctx, queries, bus, cfg)
+	tick := func() {
+		if guard != nil {
+			_ = guard(ctx, "autopilot-failure-cycle", true, func(opctx context.Context) error { tickAutopilotFailureMonitor(opctx, queries, bus, cfg); return nil })
+		} else {
+			tickAutopilotFailureMonitor(ctx, queries, bus, cfg)
+		}
+	}
+	tick()
 
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
@@ -105,7 +116,7 @@ func runAutopilotFailureMonitor(ctx context.Context, queries *db.Queries, bus *e
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			tickAutopilotFailureMonitor(ctx, queries, bus, cfg)
+			tick()
 		}
 	}
 }

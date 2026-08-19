@@ -90,6 +90,8 @@ type Manager struct {
 
 	distributedRedis   *redis.Client
 	consumeDistributed bool
+	operationGuard     func(context.Context, string, bool, func(context.Context) error) error
+	wg                 sync.WaitGroup
 }
 
 // NewManager wires the pipeline. onApplied is called once per PR row whose
@@ -133,6 +135,12 @@ func (m *Manager) ConfigureDistributedQueue(client *redis.Client, consume bool) 
 	m.consumeDistributed = consume
 }
 
+func (m *Manager) SetOperationGuard(guard func(context.Context, string, bool, func(context.Context) error) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.operationGuard = guard
+}
+
 // Start launches the worker pool and the TTL sweeper under ctx. No-op (and
 // safe) when the manager is disabled.
 func (m *Manager) Start(ctx context.Context) {
@@ -149,13 +157,19 @@ func (m *Manager) Start(ctx context.Context) {
 	m.mu.Unlock()
 
 	for i := 0; i < m.concurrency; i++ {
-		go m.worker(ctx)
+		m.wg.Add(1)
+		go func() { defer m.wg.Done(); m.worker(ctx) }()
 	}
 	if m.distributedRedis != nil && m.consumeDistributed {
-		go m.distributedConsumer(ctx)
+		m.wg.Add(1)
+		go func() { defer m.wg.Done(); m.distributedConsumer(ctx) }()
 	}
-	go m.sweepLoop(ctx)
+	m.wg.Add(1)
+	go func() { defer m.wg.Done(); m.sweepLoop(ctx) }()
 }
+
+// Wait joins every worker, distributed consumer, and sweeper started by Start.
+func (m *Manager) Wait() { m.wg.Wait() }
 
 // Enqueue schedules a refresh for a PR address. Repeated events coalesce, but
 // an event that arrives while the address is queued or in flight leaves one
@@ -268,7 +282,17 @@ func (m *Manager) worker(ctx context.Context) {
 			m.mu.Lock()
 			m.inFlight[addr] = true
 			m.mu.Unlock()
-			m.process(ctx, addr)
+			m.mu.Lock()
+			guard := m.operationGuard
+			m.mu.Unlock()
+			if guard != nil {
+				_ = guard(ctx, "pr-refresh-claim", true, func(runCtx context.Context) error {
+					m.process(runCtx, addr)
+					return nil
+				})
+			} else {
+				m.process(ctx, addr)
+			}
 			m.finish(addr)
 		}
 	}

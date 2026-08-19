@@ -70,9 +70,22 @@ type Migration struct {
 }
 
 type Combination struct {
-	Decision     string `json:"decision"`
-	Report       string `json:"report,omitempty"`
-	ReportSHA256 string `json:"report_sha256,omitempty"`
+	Decision     string              `json:"decision"`
+	Report       string              `json:"report,omitempty"`
+	ReportSHA256 string              `json:"report_sha256,omitempty"`
+	Deployment   *DeploymentIdentity `json:"deployment,omitempty"`
+}
+
+// DeploymentIdentity binds an ALLOW decision to the immutable artifacts that
+// are actually expanded by Compose, rather than values asserted by a report.
+type DeploymentIdentity struct {
+	WebImage                  string `json:"web_image"`
+	WorkerImage               string `json:"worker_image"`
+	FrontendImage             string `json:"frontend_image"`
+	MigratorImage             string `json:"migrator_image"`
+	ConfigChecksum            string `json:"config_checksum"`
+	FeatureFlagsChecksum      string `json:"feature_flags_checksum"`
+	MigrationManifestChecksum string `json:"migration_manifest_checksum"`
 }
 
 type Manifest struct {
@@ -229,12 +242,16 @@ func Validate(manifest Manifest, artifactDir string) error {
 		}
 		switch combination.Decision {
 		case DecisionDeny:
-			if combination.Report != "" || combination.ReportSHA256 != "" {
+			if combination.Report != "" || combination.ReportSHA256 != "" || combination.Deployment != nil {
 				problems = append(problems, key+": DENY must not carry a smoke report")
 			}
 		case DecisionAllow:
-			if combination.Report == "" || !digestPattern.MatchString(combination.ReportSHA256) {
-				problems = append(problems, key+": ALLOW requires report and report_sha256")
+			if combination.Report == "" || !digestPattern.MatchString(combination.ReportSHA256) || combination.Deployment == nil {
+				problems = append(problems, key+": ALLOW requires report, report_sha256, and deployment identity")
+				continue
+			}
+			if err := validateDeploymentIdentity(*combination.Deployment); err != nil {
+				problems = append(problems, key+": "+err.Error())
 				continue
 			}
 			path := filepath.Join(artifactDir, filepath.Clean(combination.Report))
@@ -423,6 +440,8 @@ func fileSHA256(path string) (string, error) {
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:]), nil
 }
+
+func FileSHA256(path string) (string, error) { return fileSHA256(path) }
 
 func contains(values []string, target string) bool {
 	for _, value := range values {

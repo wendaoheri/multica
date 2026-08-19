@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -32,11 +33,13 @@ type WorkerStatus struct {
 }
 
 type WorkerController struct {
-	store      workerControlStore
-	generation int64
-	owner      string
-	relayOK    func(context.Context) error
-	poll       time.Duration
+	store        workerControlStore
+	generation   int64
+	owner        string
+	relayOK      func(context.Context) error
+	poll         time.Duration
+	drainTimeout time.Duration
+	localClosed  atomic.Bool
 
 	mu     sync.RWMutex
 	status WorkerStatus
@@ -62,8 +65,9 @@ func NewWorkerController(store workerControlStore, generation int64, owner strin
 	}
 	return &WorkerController{
 		store: store, generation: generation, owner: owner, relayOK: relayOK,
-		poll:   time.Second,
-		status: WorkerStatus{State: WorkerClaimsDisabled, ExpectedGeneration: generation, Owner: owner},
+		poll:         time.Second,
+		drainTimeout: 3 * time.Second,
+		status:       WorkerStatus{State: WorkerClaimsDisabled, ExpectedGeneration: generation, Owner: owner},
 	}
 }
 
@@ -84,6 +88,9 @@ func (c *WorkerController) update(fn func(*WorkerStatus)) {
 // channel/media); false is used by bounded sweeps. Drain cannot release owner
 // until every acquired token is returned.
 func (c *WorkerController) RunFenced(ctx context.Context, kind string, lease bool, run func(context.Context) error) error {
+	if c.localClosed.Load() {
+		return fmt.Errorf("%s rejected: worker is locally fail-closed", kind)
+	}
 	acquire := c.store.AcquireOperation
 	release := c.store.ReleaseOperation
 	if lease {
@@ -92,6 +99,12 @@ func (c *WorkerController) RunFenced(ctx context.Context, kind string, lease boo
 	}
 	if err := acquire(ctx, c.generation, c.owner); err != nil {
 		return fmt.Errorf("acquire %s generation fence: %w", kind, err)
+	}
+	if c.localClosed.Load() {
+		releaseCtx, cancel := context.WithTimeout(context.Background(), c.drainTimeout)
+		defer cancel()
+		_ = release(releaseCtx, c.generation, c.owner)
+		return fmt.Errorf("%s rejected: worker became locally fail-closed", kind)
 	}
 	err := run(ctx)
 	releaseCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -106,12 +119,20 @@ func (c *WorkerController) RunFenced(ctx context.Context, kind string, lease boo
 // exactly once after the DB fence binds this owner, and cancels it immediately
 // on drain, generation change, relay failure, or control-plane read failure.
 func (c *WorkerController) Run(ctx context.Context, run func(context.Context) error) error {
+	c.localClosed.Store(true)
 	ticker := time.NewTicker(c.poll)
 	defer ticker.Stop()
 	for {
 		if err := c.relayOK(ctx); err != nil {
 			c.update(func(s *WorkerStatus) { s.State = WorkerRelayUnhealthy; s.LastError = err.Error() })
-			_ = c.store.Drain(context.Background(), c.generation, c.owner)
+			drainCtx, cancel := context.WithTimeout(context.Background(), c.drainTimeout)
+			drainErr := c.store.Drain(drainCtx, c.generation, c.owner)
+			cancel()
+			if drainErr != nil {
+				c.update(func(s *WorkerStatus) {
+					s.LastError = errors.Join(err, fmt.Errorf("persist fail-closed drain: %w", drainErr)).Error()
+				})
+			}
 			return err
 		}
 		snapshot, err := c.store.Load(ctx)
@@ -141,6 +162,7 @@ func (c *WorkerController) Run(ctx context.Context, run func(context.Context) er
 
 	workerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	c.localClosed.Store(false)
 	done := make(chan error, 1)
 	c.update(func(s *WorkerStatus) { s.State = WorkerRunning; s.AcceptingNew = true; s.LastError = "" })
 	go func() { done <- run(workerCtx) }()
@@ -148,9 +170,11 @@ func (c *WorkerController) Run(ctx context.Context, run func(context.Context) er
 	for {
 		select {
 		case err := <-done:
+			c.localClosed.Store(true)
 			c.update(func(s *WorkerStatus) { s.State = WorkerDrained; s.AcceptingNew = false })
 			return err
 		case <-ctx.Done():
+			c.localClosed.Store(true)
 			c.update(func(s *WorkerStatus) { s.State = WorkerDraining; s.AcceptingNew = false })
 			cancel()
 			return <-done
@@ -158,14 +182,23 @@ func (c *WorkerController) Run(ctx context.Context, run func(context.Context) er
 		}
 
 		if err := c.relayOK(ctx); err != nil {
+			// Local rejection and cancellation must happen before any DB call.
+			c.localClosed.Store(true)
 			c.update(func(s *WorkerStatus) {
 				s.State = WorkerRelayUnhealthy
 				s.AcceptingNew = false
 				s.LastError = err.Error()
 			})
-			_ = c.store.Drain(context.Background(), c.generation, c.owner)
 			cancel()
-			<-done
+			workerErr := <-done
+			drainCtx, drainCancel := context.WithTimeout(context.Background(), c.drainTimeout)
+			drainErr := c.store.Drain(drainCtx, c.generation, c.owner)
+			drainCancel()
+			if drainErr != nil {
+				c.update(func(s *WorkerStatus) {
+					s.LastError = errors.Join(err, workerErr, fmt.Errorf("persist fail-closed drain: %w", drainErr)).Error()
+				})
+			}
 			return err
 		}
 		snapshot, err := c.store.Load(ctx)
@@ -179,6 +212,7 @@ func (c *WorkerController) Run(ctx context.Context, run func(context.Context) er
 		}
 		if err != nil || snapshot.ActiveGeneration != c.generation || snapshot.WorkerOwner != c.owner ||
 			!snapshot.ClaimsEnabled || snapshot.DrainRequested {
+			c.localClosed.Store(true)
 			c.update(func(s *WorkerStatus) {
 				s.State = WorkerDraining
 				s.AcceptingNew = false
@@ -199,6 +233,7 @@ func (c *WorkerController) Run(ctx context.Context, run func(context.Context) er
 			return workerErr
 		}
 		if err := c.store.Heartbeat(ctx, c.generation, c.owner); err != nil {
+			c.localClosed.Store(true)
 			c.update(func(s *WorkerStatus) { s.State = WorkerDraining; s.AcceptingNew = false; s.LastError = err.Error() })
 			cancel()
 			<-done

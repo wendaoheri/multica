@@ -49,6 +49,14 @@ func main() {
 		recordMigratorExecution(os.Args[2:])
 		return
 	}
+	if os.Args[1] == "begin-migrator-attempt" {
+		beginMigratorAttempt(os.Args[2:])
+		return
+	}
+	if os.Args[1] == "verify-migrator-execution" {
+		verifyMigratorExecution(os.Args[2:])
+		return
+	}
 	switch os.Args[1] {
 	case "status", "advance-generation", "admission-close", "activate", "drain", "complete-drain":
 	default:
@@ -136,9 +144,10 @@ func recordMigratorExecution(args []string) {
 	identity := fs.String("deployment-identity", "", "verified deployment identity JSON")
 	config := fs.String("config-file", "", "actual effective config")
 	flags := fs.String("feature-flags-file", "", "actual effective flags")
+	currentAttempt := fs.String("current-attempt", "", "durable current migrator attempt")
 	output := fs.String("output", "", "durable one-shot execution record")
 	_ = fs.Parse(args)
-	if *manifestPath == "" || *combination == "" || *identity == "" || *config == "" || *flags == "" || *output == "" {
+	if *manifestPath == "" || *combination == "" || *identity == "" || *config == "" || *flags == "" || *currentAttempt == "" || *output == "" {
 		fatal(errors.New("all record-migrator-execution flags are required"))
 	}
 	if *artifactDir == "" {
@@ -148,10 +157,62 @@ func recordMigratorExecution(args []string) {
 	if err != nil {
 		fatal(err)
 	}
-	if err := releasecompat.RecordMigratorExecution(manifest, *artifactDir, *combination, *identity, *config, *flags, *output, time.Now()); err != nil {
+	if err := releasecompat.RecordMigratorExecution(manifest, *artifactDir, *combination, *identity, *config, *flags, *currentAttempt, *output, time.Now()); err != nil {
 		fatal(err)
 	}
 	printJSON(map[string]any{"status": "recorded", "release_id": manifest.ReleaseID, "combination": *combination})
+}
+
+func beginMigratorAttempt(args []string) {
+	fs := flag.NewFlagSet("begin-migrator-attempt", flag.ExitOnError)
+	manifestPath := fs.String("manifest", "", "release manifest JSON")
+	artifactDir := fs.String("artifact-dir", "", "smoke artifact directory")
+	combination := fs.String("combination", "", "actual W/K/S combination")
+	identity := fs.String("deployment-identity", "", "verified deployment identity JSON")
+	config := fs.String("config-file", "", "actual effective config")
+	flags := fs.String("feature-flags-file", "", "actual effective flags")
+	output := fs.String("output", "", "durable current migrator attempt")
+	_ = fs.Parse(args)
+	if *manifestPath == "" || *combination == "" || *identity == "" || *config == "" || *flags == "" || *output == "" {
+		fatal(errors.New("all begin-migrator-attempt flags are required"))
+	}
+	if *artifactDir == "" {
+		*artifactDir = filepath.Dir(*manifestPath)
+	}
+	manifest, err := releasecompat.Load(*manifestPath)
+	if err != nil {
+		fatal(err)
+	}
+	attempt, err := releasecompat.BeginMigratorAttempt(manifest, *artifactDir, *combination, *identity, *config, *flags, *output, time.Now())
+	if err != nil {
+		fatal(err)
+	}
+	printJSON(map[string]any{"status": "started", "release_id": manifest.ReleaseID, "combination": *combination, "attempt_id": attempt.AttemptID})
+}
+
+func verifyMigratorExecution(args []string) {
+	fs := flag.NewFlagSet("verify-migrator-execution", flag.ExitOnError)
+	manifestPath := fs.String("manifest", "", "release manifest JSON")
+	artifactDir := fs.String("artifact-dir", "", "smoke artifact directory")
+	combination := fs.String("combination", "", "actual W/K/S combination")
+	currentAttempt := fs.String("current-attempt", "", "durable current migrator attempt")
+	execution := fs.String("execution-record", "", "durable successful execution record")
+	_ = fs.Parse(args)
+	if *manifestPath == "" || *combination == "" || *currentAttempt == "" || *execution == "" {
+		fatal(errors.New("all verify-migrator-execution flags are required"))
+	}
+	if *artifactDir == "" {
+		*artifactDir = filepath.Dir(*manifestPath)
+	}
+	manifest, err := releasecompat.Load(*manifestPath)
+	if err != nil {
+		fatal(err)
+	}
+	record, err := releasecompat.VerifyMigratorExecution(manifest, *artifactDir, *combination, *currentAttempt, *execution)
+	if err != nil {
+		fatal(err)
+	}
+	printJSON(map[string]any{"status": "verified", "release_id": manifest.ReleaseID, "combination": *combination, "attempt_id": record.AttemptID, "deployment": record.Deployment})
 }
 
 func verifyDeployment(args []string) {
@@ -353,6 +414,6 @@ func fatal(err error) {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, "usage: releasectl <status|advance-generation|admission-close|activate|drain|complete-drain|generate-manifest|verify-manifest|verify-deployment|record-migrator-execution|checksum>")
+	fmt.Fprintln(os.Stderr, "usage: releasectl <status|advance-generation|admission-close|activate|drain|complete-drain|generate-manifest|verify-manifest|verify-deployment|begin-migrator-attempt|record-migrator-execution|verify-migrator-execution|checksum>")
 	os.Exit(2)
 }

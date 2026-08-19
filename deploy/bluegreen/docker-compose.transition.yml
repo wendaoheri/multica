@@ -108,10 +108,18 @@ services:
     entrypoint: ["/bin/sh", "-ec"]
     command:
       - >-
-        ./releasectl verify-manifest
+        ./releasectl begin-migrator-attempt
         --manifest /release/manifest.json
         --artifact-dir /release
-        --require-combination ${TARGET_COMBINATION:?set TARGET_COMBINATION}
+        --combination ${TARGET_COMBINATION:?set TARGET_COMBINATION}
+        --deployment-identity /release/deployment.actual.json
+        --config-file /run/multica-release/config.env
+        --feature-flags-file /run/multica-release/feature-flags.yaml
+        --output /release-execution/current-attempt.json
+        && ./releasectl verify-manifest
+        --manifest /release/manifest.json
+        --artifact-dir /release
+        --require-combination ${TARGET_COMBINATION}
         --migration-dir /app/migrations
         --check-database
         && timeout 1200 ./migrate up
@@ -122,6 +130,7 @@ services:
         --deployment-identity /release/deployment.actual.json
         --config-file /run/multica-release/config.env
         --feature-flags-file /run/multica-release/feature-flags.yaml
+        --current-attempt /release-execution/current-attempt.json
         --output /release-execution/migrator-execution.json
 
 volumes:

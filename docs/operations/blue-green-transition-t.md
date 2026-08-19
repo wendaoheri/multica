@@ -68,22 +68,39 @@ concurrent indexes, pre-hooks, and backfill watermark, then forward-fix. Do not
 automatically run `migrate down`.
 
 The migrator uses the same `--profile migration` expansion and verified
-config/flags mounts as release validation. After `migrate up` exits zero it
-atomically writes `RELEASE_EXECUTION_DIR/migrator-execution.json`, bound to the
-verified deployment identity and actual input checksums. Runtime smoke reads
-that durable record after the one-shot container exits or is removed; it never
-depends on default `compose ps -q` finding a cleaned container. Missing,
-partial, failed, cross-release, or drifted records are rejected.
+config/flags mounts as release validation. Its fixed command order is:
+
+1. `begin-migrator-attempt` atomically replaces
+   `RELEASE_EXECUTION_DIR/current-attempt.json` with a cryptographically random,
+   non-reusable `attempt_id`, release/combination, complete deployment identity,
+   and RFC3339 `started_at`;
+2. verify manifest/migrations and run `migrate up`;
+3. `record-migrator-execution` atomically writes the matching attempt id,
+   `started_at`, RFC3339 `completed_at`, and deployment identity.
+
+Beginning the attempt is the first command. If it cannot persist, no verify or
+migration command runs. Once a retry begins, its new current attempt immediately
+invalidates every older success record, even for the same release, combination,
+and deployment. A verify, migration, or completion-write failure therefore
+leaves the new attempt unmatched and smoke stays closed. Runtime smoke requires
+both files, exact nonce/binding equality, strict timestamps, and
+`completed_at >= started_at`; it uses no recency window or file mtime.
+
+The durable files remain available after the one-shot container exits or is
+removed, so smoke never depends on default `compose ps -q` finding a cleaned
+migrator. Neither file contains config values or credentials.
 
 ```sh
 docker compose --profile migration \
   -f deploy/bluegreen/docker-compose.transition.yml run --rm migrator
-test -s "$RELEASE_EXECUTION_DIR/migrator-execution.json"
+test -s "$MIGRATOR_CURRENT_ATTEMPT"
+test -s "$MIGRATOR_EXECUTION_RECORD"
 ```
 
-`run --rm` is safe here because the final successful command writes the record
-through the host-mounted execution directory before Compose removes the
-container. Do not substitute an unprofiled `compose run` or a container label.
+`run --rm` is safe here because begin and completion records use the
+host-mounted execution directory before Compose removes the container. Do not
+reorder the command chain, reuse an attempt id, or substitute an unprofiled
+`compose run`, a container label, a timestamp-age check, or file mtime.
 
 ## Cutover
 

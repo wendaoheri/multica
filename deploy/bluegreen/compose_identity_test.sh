@@ -86,6 +86,10 @@ docker compose --profile migration -f "$COMPOSE_FILE" config --format json | jq 
   . as $doc |
   $doc.services.migrator.profiles == ["migration"] and
   ([$doc.services[].image | test("@sha256:[0-9a-f]{64}$")] | all) and
+  (($doc.services.migrator.command | join(" ")) as $command |
+    ($command | index("begin-migrator-attempt")) < ($command | index("verify-manifest")) and
+    ($command | index("verify-manifest")) < ($command | index("migrate up")) and
+    ($command | index("migrate up")) < ($command | index("record-migrator-execution"))) and
   (["blue-web","green-web","blue-worker","green-worker","migrator"] | all(. as $name |
     ([$doc.services[$name].volumes[] | select(.source == $config and .target == "/run/multica-release/config.env" and .read_only == true)] | length == 1) and
     ([$doc.services[$name].volumes[] | select(.source == $flags and .target == "/run/multica-release/feature-flags.yaml" and .read_only == true)] | length == 1)))' >/dev/null
@@ -129,12 +133,64 @@ if PATH="$work/bin:$PATH" RELEASECTL="$work/releasectl" CADDY_BIN="$work/bin/cad
 fi
 sed -i.bak '$d' "$config" && rm "$config.bak"
 
+"$work/releasectl" begin-migrator-attempt \
+  --manifest "$work/artifacts/manifest.json" --artifact-dir "$work/artifacts" \
+  --combination W1K1S1 --deployment-identity "$work/artifacts/deployment.actual.json" \
+  --config-file "$config" --feature-flags-file "$flags" \
+  --output "$work/execution/current-attempt.json" >/dev/null
+attempt_a=$(jq -er .attempt_id "$work/execution/current-attempt.json")
 "$work/releasectl" record-migrator-execution \
   --manifest "$work/artifacts/manifest.json" --artifact-dir "$work/artifacts" \
   --combination W1K1S1 --deployment-identity "$work/artifacts/deployment.actual.json" \
   --config-file "$config" --feature-flags-file "$flags" \
+  --current-attempt "$work/execution/current-attempt.json" \
   --output "$work/execution/migrator-execution.json" >/dev/null
-jq -e '.version == 1 and .result == "PASS" and .combination == "W1K1S1"' \
-  "$work/execution/migrator-execution.json" >/dev/null
+"$work/releasectl" verify-migrator-execution \
+  --manifest "$work/artifacts/manifest.json" --artifact-dir "$work/artifacts" \
+  --combination W1K1S1 --current-attempt "$work/execution/current-attempt.json" \
+  --execution-record "$work/execution/migrator-execution.json" >/dev/null
 
-echo "real Compose default/profile expansion, 7-service immutable identity, actual config/flags binding, release validation, and durable one-shot record: PASS"
+# A retry begins by replacing current-attempt. Until the same nonce completes,
+# the older successful execution cannot authorize runtime smoke.
+"$work/releasectl" begin-migrator-attempt \
+  --manifest "$work/artifacts/manifest.json" --artifact-dir "$work/artifacts" \
+  --combination W1K1S1 --deployment-identity "$work/artifacts/deployment.actual.json" \
+  --config-file "$config" --feature-flags-file "$flags" \
+  --output "$work/execution/current-attempt.json" >/dev/null
+attempt_b=$(jq -er .attempt_id "$work/execution/current-attempt.json")
+[ "$attempt_a" != "$attempt_b" ]
+if "$work/releasectl" verify-migrator-execution \
+  --manifest "$work/artifacts/manifest.json" --artifact-dir "$work/artifacts" \
+  --combination W1K1S1 --current-attempt "$work/execution/current-attempt.json" \
+  --execution-record "$work/execution/migrator-execution.json" >/dev/null 2>&1; then
+  echo "old success authorized a new current attempt" >&2
+  exit 1
+fi
+if "$work/releasectl" record-migrator-execution \
+  --manifest "$work/artifacts/manifest.json" --artifact-dir "$work/artifacts" \
+  --combination W1K1S1 --deployment-identity "$work/artifacts/deployment.actual.json" \
+  --config-file "$config" --feature-flags-file "$flags" \
+  --current-attempt "$work/execution/current-attempt.json" \
+  --output "$work/missing/migrator-execution.json" >/dev/null 2>&1; then
+  echo "completion record write failure was not propagated" >&2
+  exit 1
+fi
+if "$work/releasectl" verify-migrator-execution \
+  --manifest "$work/artifacts/manifest.json" --artifact-dir "$work/artifacts" \
+  --combination W1K1S1 --current-attempt "$work/execution/current-attempt.json" \
+  --execution-record "$work/execution/migrator-execution.json" >/dev/null 2>&1; then
+  echo "old success authorized after completion write failure" >&2
+  exit 1
+fi
+"$work/releasectl" record-migrator-execution \
+  --manifest "$work/artifacts/manifest.json" --artifact-dir "$work/artifacts" \
+  --combination W1K1S1 --deployment-identity "$work/artifacts/deployment.actual.json" \
+  --config-file "$config" --feature-flags-file "$flags" \
+  --current-attempt "$work/execution/current-attempt.json" \
+  --output "$work/execution/migrator-execution.json" >/dev/null
+"$work/releasectl" verify-migrator-execution \
+  --manifest "$work/artifacts/manifest.json" --artifact-dir "$work/artifacts" \
+  --combination W1K1S1 --current-attempt "$work/execution/current-attempt.json" \
+  --execution-record "$work/execution/migrator-execution.json" >/dev/null
+
+echo "real Compose identity plus non-reusable begin/complete one-shot attempt lifecycle: PASS"

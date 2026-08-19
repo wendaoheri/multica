@@ -5,7 +5,9 @@ set -eu
 : "${COMPOSE_FILE:?set COMPOSE_FILE}"
 : "${RELEASE_MANIFEST:?set RELEASE_MANIFEST}"
 : "${RUNTIME_IDENTITY_REPORT:?set RUNTIME_IDENTITY_REPORT}"
+: "${MIGRATOR_CURRENT_ATTEMPT:?set MIGRATOR_CURRENT_ATTEMPT from the latest one-shot attempt}"
 : "${MIGRATOR_EXECUTION_RECORD:?set MIGRATOR_EXECUTION_RECORD from the completed one-shot migrator}"
+: "${RELEASECTL:=releasectl}"
 
 case "$COMBINATION" in
   W0*) web=blue-web; frontend=blue-frontend ;; W1*) web=green-web; frontend=green-frontend ;; *) exit 2 ;;
@@ -32,12 +34,11 @@ inspect_digest() {
 web_image=$(inspect_digest "$web" web_image)
 worker_image=$(inspect_digest "$worker" worker_image)
 frontend_image=$(inspect_digest "$frontend" frontend_image)
-jq -e --arg combination "$COMBINATION" --slurpfile manifest "$RELEASE_MANIFEST" '
-  .version == 1 and .result == "PASS" and
-  .release_id == $manifest[0].release_id and .combination == $combination and
-  .deployment == $manifest[0].combinations[$combination].deployment
-' "$MIGRATOR_EXECUTION_RECORD" >/dev/null
-migrator_image=$(jq -er '.deployment.migrator_image' "$MIGRATOR_EXECUTION_RECORD")
+migrator_verification=$("$RELEASECTL" verify-migrator-execution \
+  --manifest "$RELEASE_MANIFEST" --artifact-dir "$(dirname "$RELEASE_MANIFEST")" \
+  --combination "$COMBINATION" --current-attempt "$MIGRATOR_CURRENT_ATTEMPT" \
+  --execution-record "$MIGRATOR_EXECUTION_RECORD")
+migrator_image=$(printf '%s' "$migrator_verification" | jq -er '.deployment.migrator_image')
 jq -n --arg combination "$COMBINATION" --arg web "$web_image" --arg worker "$worker_image" \
   --arg frontend "$frontend_image" --arg migrator "$migrator_image" --slurpfile manifest "$RELEASE_MANIFEST" '
   {release_id:$manifest[0].release_id,combination:$combination,

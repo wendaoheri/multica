@@ -9,8 +9,7 @@ on:
       - "!v*-dirty*"
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 jobs:
   verify:
@@ -59,6 +58,8 @@ jobs:
 
   release:
     needs: verify
+    permissions:
+      contents: write
     # Only run on the canonical upstream repo. Forks don't have the
     # HOMEBREW_TAP_GITHUB_TOKEN secret and should not be publishing to
     # `multica-ai/homebrew-tap` anyway. Without this guard, every fork's
@@ -93,6 +94,9 @@ jobs:
   # arm64 build run for 30+ minutes per release.
   docker-backend-build:
     needs: verify
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -119,6 +123,7 @@ jobs:
           labels: |
             org.opencontainers.image.title=Multica Backend
             org.opencontainers.image.description=Multica self-hosted backend
+            org.opencontainers.image.revision=${{ github.sha }}
 
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -162,6 +167,9 @@ jobs:
 
   docker-backend-merge:
     needs: [verify, docker-backend-build]
+    permissions:
+      contents: read
+      packages: write
     runs-on: ubuntu-latest
     concurrency:
       group: release-docker-backend-${{ github.ref }}
@@ -187,7 +195,7 @@ jobs:
           tags: |
             type=raw,value=latest,enable=${{ needs.verify.outputs.is_stable == 'true' }}
             type=raw,value=${{ needs.verify.outputs.tag_name }}
-            type=sha,prefix=sha-
+            type=raw,value=sha-${{ github.sha }}
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -210,6 +218,9 @@ jobs:
 
   docker-web-build:
     needs: verify
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -236,6 +247,7 @@ jobs:
           labels: |
             org.opencontainers.image.title=Multica Web
             org.opencontainers.image.description=Multica self-hosted web frontend
+            org.opencontainers.image.revision=${{ github.sha }}
 
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -279,6 +291,9 @@ jobs:
 
   docker-web-merge:
     needs: [verify, docker-web-build]
+    permissions:
+      contents: read
+      packages: write
     runs-on: ubuntu-latest
     concurrency:
       group: release-docker-web-${{ github.ref }}
@@ -304,7 +319,7 @@ jobs:
           tags: |
             type=raw,value=latest,enable=${{ needs.verify.outputs.is_stable == 'true' }}
             type=raw,value=${{ needs.verify.outputs.tag_name }}
-            type=sha,prefix=sha-
+            type=raw,value=sha-${{ github.sha }}
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -328,6 +343,9 @@ jobs:
   helm-chart:
     needs: [verify, docker-backend-merge, docker-web-merge]
     if: github.repository_owner == 'multica-ai'
+    permissions:
+      contents: read
+      packages: write
     runs-on: ubuntu-latest
     concurrency:
       group: release-helm-chart-${{ github.ref }}
@@ -373,6 +391,8 @@ jobs:
   # not (yet) wired into CI.
   desktop:
     needs: release
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
